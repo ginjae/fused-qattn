@@ -6,17 +6,95 @@ The core objective is to integrate **dequantization** and **attention operations
 
 ## 🚀 Overview
 
-Modern LLMs rely heavily on the attention mechanism, which becomes **memory-bound** due to repeated global memory accesses across multiple kernels. Quantized models alleviate storage cost but introduce **additional overhead for dequantization**, typically executed as a standalone kernel before matrix multiplication.
+Attention in modern Large Language Models (LLMs) is fundamentally **memory-bound**, as it requires multiple passes over large activation and weight tensors across several independent CUDA kernels. When using **block-wise weight-only quantization** formats such as NF4, MXFP4, or NVFP4, an additional overhead is introduced by **dequantization**, which is typically executed as a standalone kernel. This increases global memory traffic and undermines the data locality necessary for high-throughput inference.
 
-This project tackles this bottleneck by fusing:
+This project addresses these challenges by introducing a **two-kernel, quantization-aware fused attention pipeline**, inspired by the I/O-aware philosophy of FlashAttention but optimized for quantized LLMs. The objective is to reorganize computation so that intermediate results remain on-chip, minimizing redundant memory transfers.
 
-1. **Block-wise Dequantization**  
-2. **Q·Kᵀ MatMul with on-chip tiling**  
-3. **Scaling + Masking**  
-4. **Chunk-wise Softmax**  
-5. **Attention Score Application (A·V)**  
+Our design consists of two fused kernels:
 
-all within a **single CUDA kernel**, inspired by FlashAttention-style I/O-aware design.
+### 1. First Kernel — Block Dequantization + Fused Q/K/V Projection
+This kernel performs block-wise dequantization of the quantized weight matrices and immediately consumes the dequantized values within a tiled matmul to compute $[Q\,|\,K\,|\,V] = X[W_Q\,|\,W_K\,|\,W_V]$.
+Without writing dequantized weights back to global memory, it significantly reduces memory I/O and preserves data locality.
+
+### 2. Second Kernel — Flash-style Tiled Attention
+This kernel implements the core attention pipeline in a fully fused manner.
+The tiled execution reuses Q, K, and V efficiently across shared memory and registers, further minimizing global memory access.
+
+This two-kernel architecture balances aggressive operator fusion with practical implementation constraints. Compared to conventional multi-kernel attention and quantization workflows, it **significantly lowers memory traffic**, enhances **on-chip data reuse**, and delivers **substantial inference throughput improvements** for quantized LLMs.
+
+
+# Baselines
+
+## Naïve Sequential Attention
+
+There are six kernel functions, each of which is for:
+
+1. $W_Q, W_K, W_V$ de-quantization
+2. Naïve matmul: $Q=XW_Q, K=XW_K, V=XW_V$
+3. Naïve matmul: $QK^\top$
+4. Scaling: $QK^\top\over{\sqrt{d_k}}$
+
+    \+
+    Causal masking
+5. $\text{softmax}({QK^\top\over{\sqrt{d_k}}})$
+6. Naïve matmul: $\text{Attention}(Q, K, V) = \text{softmax}({QK^\top\over{\sqrt{d_k}}}) V$ 
+
+## Tiled Sequential Attention
+
+There are six kernel functions, each of which is for:
+
+1. $W_Q, W_K, W_V$ de-quantization
+2. Tiled matmul: $Q=XW_Q, K=XW_K, V=XW_V$
+3. Tiled matmul: $QK^\top$
+4. Scaling: $QK^\top\over{\sqrt{d_k}}$
+
+    \+
+    Causal masking
+5. $\text{chunk-wise softmax}({QK^\top\over{\sqrt{d_k}}})$
+6. Tiled matmul: $\text{Attention}(Q, K, V) = \text{chunk-wise softmax}({QK^\top\over{\sqrt{d_k}}}) V$
+
+## Tiled Fused Attention (Flash-style)
+
+There are three kernel functions, each of which is for:
+
+1. $W_Q, W_K, W_V$ de-quantization
+2. Fused & Tiled matmul: $[Q|K|V]=X[W_Q|W_K|W_V]$
+3. Tiled matmul: $QK^\top$
+
+    \+
+    Scaling: $QK^\top\over{\sqrt{d_k}}$
+
+    \+
+    Causal masking
+
+    \+
+    $\text{chunk-wise softmax}({QK^\top\over{\sqrt{d_k}}})$
+
+    \+
+    Tiled matmul: $\text{Attention}(Q, K, V) = \text{chunk-wise softmax}({QK^\top\over{\sqrt{d_k}}}) V$
+
+
+# Quantization-Aware Tiled Fused Attention (Ours)
+
+There are two kernel functions, each of which is for:
+
+1. $W_Q, W_K, W_V$ de-quantization 
+
+    \+
+    Fused & Tiled matmul: $[Q|K|V]=X[W_Q|W_K|W_V]$
+2. Tiled matmul: $QK^\top$
+
+    \+
+    Scaling: $QK^\top\over{\sqrt{d_k}}$
+
+    \+
+    Causal masking
+
+    \+
+    $\text{chunk-wise softmax}({QK^\top\over{\sqrt{d_k}}})$
+
+    \+
+    Tiled matmul: $\text{Attention}(Q, K, V) = \text{chunk-wise softmax}({QK^\top\over{\sqrt{d_k}}}) V$
 
 
 ## 🤝 Contributors
