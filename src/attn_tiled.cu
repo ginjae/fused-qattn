@@ -197,38 +197,79 @@ __global__ void scale_mask_kernel(
     }
 }
 
-// Kernel 3: Softmax (row-wise)
+// Kernel 3: Chunk-wise Softmax
 // QK: [batch, seq_len, seq_len]
 // Output: [batch, seq_len, seq_len]
+// Uses shared memory for chunk-based computation to improve memory access patterns
+#define CHUNK_SIZE 256
+
 __global__ void softmax_kernel(
     const float* QK,
     float* A,
     int batch,
     int seq_len
 ) {
+    __shared__ float shared_max[CHUNK_SIZE];
+    __shared__ float shared_sum[CHUNK_SIZE];
+
     int b = blockIdx.y;
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
 
-    if (b < batch && row < seq_len) {
-        int base_idx = b * seq_len * seq_len + row * seq_len;
+    if (b >= batch || row >= seq_len) return;
 
-        // Find max for numerical stability
-        float max_val = -INFINITY;
-        for (int i = 0; i < seq_len; i++) {
-            max_val = fmaxf(max_val, QK[base_idx + i]);
+    int base_idx = b * seq_len * seq_len + row * seq_len;
+    int num_chunks = (seq_len + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+    // Phase 1: Find global max across all chunks
+    float local_max = -INFINITY;
+    for (int chunk = 0; chunk < num_chunks; chunk++) {
+        int idx = chunk * CHUNK_SIZE + tid;
+        if (idx < seq_len) {
+            local_max = fmaxf(local_max, QK[base_idx + idx]);
         }
+    }
+    shared_max[tid] = local_max;
+    __syncthreads();
 
-        // Compute exp and sum
-        float sum = 0.0f;
-        for (int i = 0; i < seq_len; i++) {
-            float exp_val = expf(QK[base_idx + i] - max_val);
-            A[base_idx + i] = exp_val;
-            sum += exp_val;
+    // Reduce to find global max
+    for (int s = CHUNK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_max[tid] = fmaxf(shared_max[tid], shared_max[tid + s]);
         }
+        __syncthreads();
+    }
+    float global_max = shared_max[0];
+    __syncthreads();
 
-        // Normalize
-        for (int i = 0; i < seq_len; i++) {
-            A[base_idx + i] /= sum;
+    // Phase 2: Compute exp and partial sums for each chunk
+    float local_sum = 0.0f;
+    for (int chunk = 0; chunk < num_chunks; chunk++) {
+        int idx = chunk * CHUNK_SIZE + tid;
+        if (idx < seq_len) {
+            float exp_val = expf(QK[base_idx + idx] - global_max);
+            A[base_idx + idx] = exp_val;
+            local_sum += exp_val;
+        }
+    }
+    shared_sum[tid] = local_sum;
+    __syncthreads();
+
+    // Reduce to find global sum
+    for (int s = CHUNK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sum[tid] += shared_sum[tid + s];
+        }
+        __syncthreads();
+    }
+    float global_sum = shared_sum[0];
+    __syncthreads();
+
+    // Phase 3: Normalize each chunk
+    for (int chunk = 0; chunk < num_chunks; chunk++) {
+        int idx = chunk * CHUNK_SIZE + tid;
+        if (idx < seq_len) {
+            A[base_idx + idx] /= global_sum;
         }
     }
 }
@@ -388,9 +429,9 @@ void naive_attention_quantized(
     scale_mask_kernel<<<grid1, block1>>>(d_QK, batch, seq_len, scale_factor, causal_mask);
     CUDA_CHECK(cudaGetLastError());
 
-    // Step 3: Softmax
-    dim3 block2(256);
-    dim3 grid2((seq_len + block2.x - 1) / block2.x, batch);
+    // Step 3: Chunk-wise Softmax
+    dim3 block2(CHUNK_SIZE);
+    dim3 grid2(seq_len, batch);
     softmax_kernel<<<grid2, block2>>>(d_QK, d_A, batch, seq_len);
     CUDA_CHECK(cudaGetLastError());
 
@@ -475,9 +516,9 @@ void naive_attention(
     scale_mask_kernel<<<grid1, block1>>>(d_QK, batch, seq_len, scale_factor, causal_mask);
     CUDA_CHECK(cudaGetLastError());
 
-    // Step 3: Softmax
-    dim3 block2(256);
-    dim3 grid2((seq_len + block2.x - 1) / block2.x, batch);
+    // Step 3: Chunk-wise Softmax
+    dim3 block2(CHUNK_SIZE);
+    dim3 grid2(seq_len, batch);
     softmax_kernel<<<grid2, block2>>>(d_QK, d_A, batch, seq_len);
     CUDA_CHECK(cudaGetLastError());
 
