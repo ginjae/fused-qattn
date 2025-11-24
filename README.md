@@ -2,6 +2,7 @@
 
 This repository explores the design and implementation of a fused CUDA kernel tailored for **quantized Large Language Models (LLMs)**, focusing on **attention layers** that operate on **block-wise quantized weights**, (e.g., NF4, MXFP4, NVFP4).  
 The core objective is to integrate **dequantization** and **attention operations** (matmul, scaling, masking, softmax, ...) into a single I/O-aware kernel to substantially reduce memory traffic and improve inference throughput.  
+> This project was implemented using CUDA 12.4.
 
 
 ## 🚀 Overview

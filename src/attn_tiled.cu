@@ -34,15 +34,15 @@ __global__ void dequantize_blockwise_kernel(
 
     if (row < rows && col < cols) {
         int idx = row * cols + col;
-        
+
         // Determine which block this element belongs to
         int block_idx = idx / block_size;
-        
+
         // Dequantize: float_value = scale * (quantized_value - zero_point)
         float scale = scales[block_idx];
         int8_t zero_point = zero_points[block_idx];
         int8_t quantized_val = W_quantized[idx];
-        
+
         W_dequantized[idx] = scale * (float)(quantized_val - zero_point);
     }
 }
@@ -331,8 +331,8 @@ __global__ void av_matmul_tiled_kernel(
     }
 }
 
-// Host function to perform complete naive attention with quantized weight matrices
-void naive_attention_quantized(
+// Host function to perform complete tiled attention with quantized weight matrices
+void tiled_attention_quantized(
     const float* d_X,
     const int8_t* d_Wq_quantized,
     const int8_t* d_Wk_quantized,
@@ -363,7 +363,7 @@ void naive_attention_quantized(
 
     // Dequantize weights
     dim3 block_dequant(16, 16);
-    
+
     // Dequantize Wq
     dim3 grid_wq((d_k + block_dequant.x - 1) / block_dequant.x,
                  (d_model + block_dequant.y - 1) / block_dequant.y);
@@ -456,7 +456,7 @@ void naive_attention_quantized(
 }
 
 // Original host function (kept for backward compatibility)
-void naive_attention(
+void tiled_attention(
     const float* d_X,
     const float* d_Wq,
     const float* d_Wk,
@@ -628,19 +628,19 @@ int main() {
 
     // Test 1: Tiled attention with original (unquantized) weights
     printf("\n=== Test 1: Tiled Attention (Unquantized Weights) ===\n");
-    
+
     // Dummy run to warm up GPU
     printf("Running dummy run for warm-up...\n");
-    naive_attention(d_X, d_Wq, d_Wk, d_Wv, d_bq, d_bk, d_bv, 
+    tiled_attention(d_X, d_Wq, d_Wk, d_Wv, d_bq, d_bk, d_bv, 
                     d_output, batch, seq_len, d_model, d_k, d_v, false);
     CUDA_CHECK(cudaDeviceSynchronize());
-    
+
     // Start timing
     CUDA_CHECK(cudaEventRecord(start));
-    
-    naive_attention(d_X, d_Wq, d_Wk, d_Wv, d_bq, d_bk, d_bv, 
+
+    tiled_attention(d_X, d_Wq, d_Wk, d_Wv, d_bq, d_bk, d_bv, 
                     d_output, batch, seq_len, d_model, d_k, d_v, false);
-    
+
     // Stop timing
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
@@ -671,63 +671,63 @@ int main() {
     printf("\n=== Quantizing Weights ===\n");
     int num_blocks_q = (d_model * d_k + block_size - 1) / block_size;
     int num_blocks_v = (d_model * d_v + block_size - 1) / block_size;
-    
+
     int8_t* h_Wq_quant = (int8_t*)malloc(d_model * d_k * sizeof(int8_t));
     int8_t* h_Wk_quant = (int8_t*)malloc(d_model * d_k * sizeof(int8_t));
     int8_t* h_Wv_quant = (int8_t*)malloc(d_model * d_v * sizeof(int8_t));
-    
+
     float* h_Wq_scales = (float*)malloc(num_blocks_q * sizeof(float));
     float* h_Wk_scales = (float*)malloc(num_blocks_q * sizeof(float));
     float* h_Wv_scales = (float*)malloc(num_blocks_v * sizeof(float));
-    
+
     int8_t* h_Wq_zeros = (int8_t*)malloc(num_blocks_q * sizeof(int8_t));
     int8_t* h_Wk_zeros = (int8_t*)malloc(num_blocks_q * sizeof(int8_t));
     int8_t* h_Wv_zeros = (int8_t*)malloc(num_blocks_v * sizeof(int8_t));
-    
+
     quantize_blockwise(h_Wq, h_Wq_quant, h_Wq_scales, h_Wq_zeros, d_model * d_k, block_size);
     quantize_blockwise(h_Wk, h_Wk_quant, h_Wk_scales, h_Wk_zeros, d_model * d_k, block_size);
     quantize_blockwise(h_Wv, h_Wv_quant, h_Wv_scales, h_Wv_zeros, d_model * d_v, block_size);
-    
+
     printf("Block size: %d\n", block_size);
     printf("Num blocks (Q/K): %d, Num blocks (V): %d\n", num_blocks_q, num_blocks_v);
     printf("Quantization complete.\n");
-    
+
     // Test 2: Tiled attention with quantized weights (GPU dequantization)
     printf("\n=== Test 2: Tiled Attention (Quantized Weights) ===\n");
-    
+
     // Allocate device memory for quantized weights
     int8_t *d_Wq_quant, *d_Wk_quant, *d_Wv_quant;
     float *d_Wq_scales, *d_Wk_scales, *d_Wv_scales;
     int8_t *d_Wq_zeros, *d_Wk_zeros, *d_Wv_zeros;
-    
+
     CUDA_CHECK(cudaMalloc(&d_Wq_quant, d_model * d_k * sizeof(int8_t)));
     CUDA_CHECK(cudaMalloc(&d_Wk_quant, d_model * d_k * sizeof(int8_t)));
     CUDA_CHECK(cudaMalloc(&d_Wv_quant, d_model * d_v * sizeof(int8_t)));
-    
+
     CUDA_CHECK(cudaMalloc(&d_Wq_scales, num_blocks_q * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_Wk_scales, num_blocks_q * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_Wv_scales, num_blocks_v * sizeof(float)));
-    
+
     CUDA_CHECK(cudaMalloc(&d_Wq_zeros, num_blocks_q * sizeof(int8_t)));
     CUDA_CHECK(cudaMalloc(&d_Wk_zeros, num_blocks_q * sizeof(int8_t)));
     CUDA_CHECK(cudaMalloc(&d_Wv_zeros, num_blocks_v * sizeof(int8_t)));
-    
+
     // Copy quantized data to device
     CUDA_CHECK(cudaMemcpy(d_Wq_quant, h_Wq_quant, d_model * d_k * sizeof(int8_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_Wk_quant, h_Wk_quant, d_model * d_k * sizeof(int8_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_Wv_quant, h_Wv_quant, d_model * d_v * sizeof(int8_t), cudaMemcpyHostToDevice));
-    
+
     CUDA_CHECK(cudaMemcpy(d_Wq_scales, h_Wq_scales, num_blocks_q * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_Wk_scales, h_Wk_scales, num_blocks_q * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_Wv_scales, h_Wv_scales, num_blocks_v * sizeof(float), cudaMemcpyHostToDevice));
-    
+
     CUDA_CHECK(cudaMemcpy(d_Wq_zeros, h_Wq_zeros, num_blocks_q * sizeof(int8_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_Wk_zeros, h_Wk_zeros, num_blocks_q * sizeof(int8_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_Wv_zeros, h_Wv_zeros, num_blocks_v * sizeof(int8_t), cudaMemcpyHostToDevice));
-    
+
     // Dummy run to warm up GPU
     printf("Running dummy run for warm-up...\n");
-    naive_attention_quantized(d_X, 
+    tiled_attention_quantized(d_X, 
                               d_Wq_quant, d_Wk_quant, d_Wv_quant,
                               d_Wq_scales, d_Wk_scales, d_Wv_scales,
                               d_Wq_zeros, d_Wk_zeros, d_Wv_zeros,
@@ -735,27 +735,27 @@ int main() {
                               d_output, batch, seq_len, d_model, d_k, d_v,
                               block_size, false);
     CUDA_CHECK(cudaDeviceSynchronize());
-    
+
     // Start timing
     CUDA_CHECK(cudaEventRecord(start));
-    
+
     // Run quantized attention
-    naive_attention_quantized(d_X, 
+    tiled_attention_quantized(d_X, 
                               d_Wq_quant, d_Wk_quant, d_Wv_quant,
                               d_Wq_scales, d_Wk_scales, d_Wv_scales,
                               d_Wq_zeros, d_Wk_zeros, d_Wv_zeros,
                               d_bq, d_bk, d_bv,
                               d_output, batch, seq_len, d_model, d_k, d_v,
                               block_size, false);
-    
+
     // Stop timing
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
     CUDA_CHECK(cudaEventElapsedTime(&elapsed_time_quant, start, stop));
-    
+
     // Copy quantized result back
     CUDA_CHECK(cudaMemcpy(h_output_quant, d_output, out_size, cudaMemcpyDeviceToHost));
-    
+
     // Print quantized results (first 3 and last 3 positions only)
     printf("Output (Quantized) - showing first 3 and last 3 positions:\n");
     for (int i = 0; i < seq_len; i++) {
@@ -779,15 +779,15 @@ int main() {
     float max_diff = 0.0f;
     float sum_sq_diff = 0.0f;
     int total_elements = batch * seq_len * d_v;
-    
+
     for (int i = 0; i < total_elements; i++) {
         float diff = fabsf(h_output_unquant[i] - h_output_quant[i]);
         max_diff = fmaxf(max_diff, diff);
         sum_sq_diff += diff * diff;
     }
-    
+
     float rmse = sqrtf(sum_sq_diff / total_elements);
-    
+
     printf("Max absolute difference: %.8f\n", max_diff);
     printf("RMSE: %.8f\n", rmse);
     printf("\n=== Performance Comparison ===\n");
@@ -819,7 +819,7 @@ int main() {
     free(h_Wq_zeros);
     free(h_Wk_zeros);
     free(h_Wv_zeros);
-    
+
     CUDA_CHECK(cudaFree(d_X));
     CUDA_CHECK(cudaFree(d_Wq));
     CUDA_CHECK(cudaFree(d_Wk));
