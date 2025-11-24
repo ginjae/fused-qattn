@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <math.h>
+#include "quantization_utils.cuh"
 
 #define CUDA_CHECK(call) \
     do { \
@@ -11,6 +12,40 @@
             exit(EXIT_FAILURE); \
         } \
     } while(0)
+
+// Kernel for Block-wise Dequantization
+// Dequantizes int8 weights to float using block-wise scale and zero-point
+// W_quantized: [rows * cols] int8 values
+// scales: [num_blocks] scale factors
+// zero_points: [num_blocks] zero points
+// W_dequantized: [rows * cols] output float values
+// block_size: number of elements per quantization block
+__global__ void dequantize_blockwise_kernel(
+    const int8_t* W_quantized,
+    const float* scales,
+    const int8_t* zero_points,
+    float* W_dequantized,
+    int rows,
+    int cols,
+    int block_size
+) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < rows && col < cols) {
+        int idx = row * cols + col;
+        
+        // Determine which block this element belongs to
+        int block_idx = idx / block_size;
+        
+        // Dequantize: float_value = scale * (quantized_value - zero_point)
+        float scale = scales[block_idx];
+        int8_t zero_point = zero_points[block_idx];
+        int8_t quantized_val = W_quantized[idx];
+        
+        W_dequantized[idx] = scale * (float)(quantized_val - zero_point);
+    }
+}
 
 // Kernel 0: Linear Projection (X·W + b)
 // X: [batch, seq_len, d_model]
@@ -177,7 +212,131 @@ __global__ void av_matmul_kernel(
     }
 }
 
-// Host function to perform complete naive attention with weight matrices
+// Host function to perform complete naive attention with quantized weight matrices
+void naive_attention_quantized(
+    const float* d_X,
+    const int8_t* d_Wq_quantized,
+    const int8_t* d_Wk_quantized,
+    const int8_t* d_Wv_quantized,
+    const float* d_Wq_scales,
+    const float* d_Wk_scales,
+    const float* d_Wv_scales,
+    const int8_t* d_Wq_zeros,
+    const int8_t* d_Wk_zeros,
+    const int8_t* d_Wv_zeros,
+    const float* d_bq,
+    const float* d_bk,
+    const float* d_bv,
+    float* d_output,
+    int batch,
+    int seq_len,
+    int d_model,
+    int d_k,
+    int d_v,
+    int block_size,
+    bool causal_mask = false
+) {
+    // Allocate temporary buffers for dequantized weights
+    float *d_Wq, *d_Wk, *d_Wv;
+    CUDA_CHECK(cudaMalloc(&d_Wq, d_model * d_k * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_Wk, d_model * d_k * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_Wv, d_model * d_v * sizeof(float)));
+
+    // Dequantize weights
+    dim3 block_dequant(16, 16);
+    
+    // Dequantize Wq
+    dim3 grid_wq((d_k + block_dequant.x - 1) / block_dequant.x,
+                 (d_model + block_dequant.y - 1) / block_dequant.y);
+    dequantize_blockwise_kernel<<<grid_wq, block_dequant>>>(
+        d_Wq_quantized, d_Wq_scales, d_Wq_zeros, d_Wq, d_model, d_k, block_size);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Dequantize Wk
+    dim3 grid_wk((d_k + block_dequant.x - 1) / block_dequant.x,
+                 (d_model + block_dequant.y - 1) / block_dequant.y);
+    dequantize_blockwise_kernel<<<grid_wk, block_dequant>>>(
+        d_Wk_quantized, d_Wk_scales, d_Wk_zeros, d_Wk, d_model, d_k, block_size);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Dequantize Wv
+    dim3 grid_wv((d_v + block_dequant.x - 1) / block_dequant.x,
+                 (d_model + block_dequant.y - 1) / block_dequant.y);
+    dequantize_blockwise_kernel<<<grid_wv, block_dequant>>>(
+        d_Wv_quantized, d_Wv_scales, d_Wv_zeros, d_Wv, d_model, d_v, block_size);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Allocate temporary buffers for Q, K, V, QK, A
+    float *d_Q, *d_K, *d_V, *d_QK, *d_A;
+    CUDA_CHECK(cudaMalloc(&d_Q, batch * seq_len * d_k * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_K, batch * seq_len * d_k * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_V, batch * seq_len * d_v * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_QK, batch * seq_len * seq_len * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_A, batch * seq_len * seq_len * sizeof(float)));
+
+    dim3 block_proj(16, 16);
+
+    // Step 0-1: Compute Q = X·Wq + bq (using dequantized weights)
+    dim3 grid_q((d_k + block_proj.x - 1) / block_proj.x,
+                (seq_len + block_proj.y - 1) / block_proj.y,
+                batch);
+    linear_projection_kernel<<<grid_q, block_proj>>>(d_X, d_Wq, d_bq, d_Q, batch, seq_len, d_model, d_k);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Step 0-2: Compute K = X·Wk + bk (using dequantized weights)
+    dim3 grid_k((d_k + block_proj.x - 1) / block_proj.x,
+                (seq_len + block_proj.y - 1) / block_proj.y,
+                batch);
+    linear_projection_kernel<<<grid_k, block_proj>>>(d_X, d_Wk, d_bk, d_K, batch, seq_len, d_model, d_k);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Step 0-3: Compute V = X·Wv + bv (using dequantized weights)
+    dim3 grid_v((d_v + block_proj.x - 1) / block_proj.x,
+                (seq_len + block_proj.y - 1) / block_proj.y,
+                batch);
+    linear_projection_kernel<<<grid_v, block_proj>>>(d_X, d_Wv, d_bv, d_V, batch, seq_len, d_model, d_v);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Step 1: Q·Kᵀ MatMul
+    dim3 block1(16, 16);
+    dim3 grid1((seq_len + block1.x - 1) / block1.x,
+               (seq_len + block1.y - 1) / block1.y,
+               batch);
+    qk_matmul_kernel<<<grid1, block1>>>(d_Q, d_K, d_QK, batch, seq_len, d_k);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Step 2: Scaling + Masking
+    float scale_factor = 1.0f / sqrtf((float)d_k);
+    scale_mask_kernel<<<grid1, block1>>>(d_QK, batch, seq_len, scale_factor, causal_mask);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Step 3: Softmax
+    dim3 block2(256);
+    dim3 grid2((seq_len + block2.x - 1) / block2.x, batch);
+    softmax_kernel<<<grid2, block2>>>(d_QK, d_A, batch, seq_len);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Step 4: A·V MatMul
+    dim3 block3(16, 16);
+    dim3 grid3((d_v + block3.x - 1) / block3.x,
+               (seq_len + block3.y - 1) / block3.y,
+               batch);
+    av_matmul_kernel<<<grid3, block3>>>(d_A, d_V, d_output, batch, seq_len, d_v);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Free temporary buffers
+    CUDA_CHECK(cudaFree(d_Q));
+    CUDA_CHECK(cudaFree(d_K));
+    CUDA_CHECK(cudaFree(d_V));
+    CUDA_CHECK(cudaFree(d_QK));
+    CUDA_CHECK(cudaFree(d_A));
+    CUDA_CHECK(cudaFree(d_Wq));
+    CUDA_CHECK(cudaFree(d_Wk));
+    CUDA_CHECK(cudaFree(d_Wv));
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+// Original host function (kept for backward compatibility)
 void naive_attention(
     const float* d_X,
     const float* d_Wq,
@@ -270,8 +429,9 @@ int main() {
     int d_model = 64;
     int d_k = 8;
     int d_v = 8;
+    int block_size = 32; // Block size for quantization
 
-    printf("=== Starting Test: Naive Attention ===\n");
+    printf("=== Starting Test: Naive Attention with Quantization ===");
 
     // Allocate and initialize host memory for input and weights
     size_t x_size = batch * seq_len * d_model * sizeof(float);
@@ -337,27 +497,179 @@ int main() {
     CUDA_CHECK(cudaMemcpy(d_bk, h_bk, bk_size, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_bv, h_bv, bv_size, cudaMemcpyHostToDevice));
 
-    // Run naive attention with weights
-    printf("Running naive attention with weight matrices...\n");
+    // Allocate output buffers for both tests
+    float* h_output_unquant = (float*)malloc(out_size);
+    float* h_output_quant = (float*)malloc(out_size);
+
+    // Create CUDA events for timing
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    float elapsed_time_unquant, elapsed_time_quant;
+
+    // Test 1: Naive attention with original (unquantized) weights
+    printf("\n=== Test 1: Naive Attention (Unquantized Weights) ===\n");
+    
+    // Dummy run to warm up GPU
+    printf("Running dummy run for warm-up...\n");
     naive_attention(d_X, d_Wq, d_Wk, d_Wv, d_bq, d_bk, d_bv, 
-                                  d_output, batch, seq_len, d_model, d_k, d_v, false);
+                    d_output, batch, seq_len, d_model, d_k, d_v, false);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    // Start timing
+    CUDA_CHECK(cudaEventRecord(start));
+    
+    naive_attention(d_X, d_Wq, d_Wk, d_Wv, d_bq, d_bk, d_bv, 
+                    d_output, batch, seq_len, d_model, d_k, d_v, false);
+    
+    // Stop timing
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_time_unquant, start, stop));
 
     // Copy result back
-    CUDA_CHECK(cudaMemcpy(h_output, d_output, out_size, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_output_unquant, d_output, out_size, cudaMemcpyDeviceToHost));
 
     // Print results
-    printf("\nOutput:\n");
+    printf("Output (Unquantized):\n");
     for (int i = 0; i < seq_len; i++) {
         printf("Position %d: [", i);
         for (int j = 0; j < d_v; j++) {
             int idx = i * d_v + j;
-            printf("%.6f", h_output[idx]);
+            printf("%.6f", h_output_unquant[idx]);
             if (j < d_v - 1) printf(", ");
         }
         printf("]\n");
     }
+    printf("Execution time: %.4f ms\n", elapsed_time_unquant);
+
+    // Quantize weights
+    printf("\n=== Quantizing Weights ===\n");
+    int num_blocks_q = (d_model * d_k + block_size - 1) / block_size;
+    int num_blocks_v = (d_model * d_v + block_size - 1) / block_size;
+    
+    int8_t* h_Wq_quant = (int8_t*)malloc(d_model * d_k * sizeof(int8_t));
+    int8_t* h_Wk_quant = (int8_t*)malloc(d_model * d_k * sizeof(int8_t));
+    int8_t* h_Wv_quant = (int8_t*)malloc(d_model * d_v * sizeof(int8_t));
+    
+    float* h_Wq_scales = (float*)malloc(num_blocks_q * sizeof(float));
+    float* h_Wk_scales = (float*)malloc(num_blocks_q * sizeof(float));
+    float* h_Wv_scales = (float*)malloc(num_blocks_v * sizeof(float));
+    
+    int8_t* h_Wq_zeros = (int8_t*)malloc(num_blocks_q * sizeof(int8_t));
+    int8_t* h_Wk_zeros = (int8_t*)malloc(num_blocks_q * sizeof(int8_t));
+    int8_t* h_Wv_zeros = (int8_t*)malloc(num_blocks_v * sizeof(int8_t));
+    
+    quantize_blockwise(h_Wq, h_Wq_quant, h_Wq_scales, h_Wq_zeros, d_model * d_k, block_size);
+    quantize_blockwise(h_Wk, h_Wk_quant, h_Wk_scales, h_Wk_zeros, d_model * d_k, block_size);
+    quantize_blockwise(h_Wv, h_Wv_quant, h_Wv_scales, h_Wv_zeros, d_model * d_v, block_size);
+    
+    printf("Block size: %d\n", block_size);
+    printf("Num blocks (Q/K): %d, Num blocks (V): %d\n", num_blocks_q, num_blocks_v);
+    printf("Quantization complete.\n");
+    
+    // Test 2: Naive attention with quantized weights (GPU dequantization)
+    printf("\n=== Test 2: Naive Attention (Quantized Weights) ===\n");
+    
+    // Allocate device memory for quantized weights
+    int8_t *d_Wq_quant, *d_Wk_quant, *d_Wv_quant;
+    float *d_Wq_scales, *d_Wk_scales, *d_Wv_scales;
+    int8_t *d_Wq_zeros, *d_Wk_zeros, *d_Wv_zeros;
+    
+    CUDA_CHECK(cudaMalloc(&d_Wq_quant, d_model * d_k * sizeof(int8_t)));
+    CUDA_CHECK(cudaMalloc(&d_Wk_quant, d_model * d_k * sizeof(int8_t)));
+    CUDA_CHECK(cudaMalloc(&d_Wv_quant, d_model * d_v * sizeof(int8_t)));
+    
+    CUDA_CHECK(cudaMalloc(&d_Wq_scales, num_blocks_q * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_Wk_scales, num_blocks_q * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_Wv_scales, num_blocks_v * sizeof(float)));
+    
+    CUDA_CHECK(cudaMalloc(&d_Wq_zeros, num_blocks_q * sizeof(int8_t)));
+    CUDA_CHECK(cudaMalloc(&d_Wk_zeros, num_blocks_q * sizeof(int8_t)));
+    CUDA_CHECK(cudaMalloc(&d_Wv_zeros, num_blocks_v * sizeof(int8_t)));
+    
+    // Copy quantized data to device
+    CUDA_CHECK(cudaMemcpy(d_Wq_quant, h_Wq_quant, d_model * d_k * sizeof(int8_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_Wk_quant, h_Wk_quant, d_model * d_k * sizeof(int8_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_Wv_quant, h_Wv_quant, d_model * d_v * sizeof(int8_t), cudaMemcpyHostToDevice));
+    
+    CUDA_CHECK(cudaMemcpy(d_Wq_scales, h_Wq_scales, num_blocks_q * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_Wk_scales, h_Wk_scales, num_blocks_q * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_Wv_scales, h_Wv_scales, num_blocks_v * sizeof(float), cudaMemcpyHostToDevice));
+    
+    CUDA_CHECK(cudaMemcpy(d_Wq_zeros, h_Wq_zeros, num_blocks_q * sizeof(int8_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_Wk_zeros, h_Wk_zeros, num_blocks_q * sizeof(int8_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_Wv_zeros, h_Wv_zeros, num_blocks_v * sizeof(int8_t), cudaMemcpyHostToDevice));
+    
+    // Dummy run to warm up GPU
+    printf("Running dummy run for warm-up...\n");
+    naive_attention_quantized(d_X, 
+                              d_Wq_quant, d_Wk_quant, d_Wv_quant,
+                              d_Wq_scales, d_Wk_scales, d_Wv_scales,
+                              d_Wq_zeros, d_Wk_zeros, d_Wv_zeros,
+                              d_bq, d_bk, d_bv,
+                              d_output, batch, seq_len, d_model, d_k, d_v,
+                              block_size, false);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    // Start timing
+    CUDA_CHECK(cudaEventRecord(start));
+    
+    // Run quantized attention
+    naive_attention_quantized(d_X, 
+                              d_Wq_quant, d_Wk_quant, d_Wv_quant,
+                              d_Wq_scales, d_Wk_scales, d_Wv_scales,
+                              d_Wq_zeros, d_Wk_zeros, d_Wv_zeros,
+                              d_bq, d_bk, d_bv,
+                              d_output, batch, seq_len, d_model, d_k, d_v,
+                              block_size, false);
+    
+    // Stop timing
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_time_quant, start, stop));
+    
+    // Copy quantized result back
+    CUDA_CHECK(cudaMemcpy(h_output_quant, d_output, out_size, cudaMemcpyDeviceToHost));
+    
+    // Print quantized results
+    printf("Output (Quantized):\n");
+    for (int i = 0; i < seq_len; i++) {
+        printf("Position %d: [", i);
+        for (int j = 0; j < d_v; j++) {
+            int idx = i * d_v + j;
+            printf("%.6f", h_output_quant[idx]);
+            if (j < d_v - 1) printf(", ");
+        }
+        printf("]\n");
+    }
+    printf("Execution time: %.4f ms\n", elapsed_time_quant);
+
+    // Compare results
+    printf("\n=== Comparison: Unquantized vs Quantized ===\n");
+    float max_diff = 0.0f;
+    float sum_sq_diff = 0.0f;
+    int total_elements = batch * seq_len * d_v;
+    
+    for (int i = 0; i < total_elements; i++) {
+        float diff = fabsf(h_output_unquant[i] - h_output_quant[i]);
+        max_diff = fmaxf(max_diff, diff);
+        sum_sq_diff += diff * diff;
+    }
+    
+    float rmse = sqrtf(sum_sq_diff / total_elements);
+    
+    printf("Max absolute difference: %.8f\n", max_diff);
+    printf("RMSE: %.8f\n", rmse);
+    printf("\n=== Performance Comparison ===\n");
+    printf("Unquantized execution time: %.4f ms\n", elapsed_time_unquant);
+    printf("Quantized execution time:   %.4f ms\n", elapsed_time_quant);
+    printf("Speedup: %.2fx\n", elapsed_time_unquant / elapsed_time_quant);
     printf("\n");
 
+    // Cleanup CUDA events
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
 
     // Cleanup
     free(h_X);
@@ -368,6 +680,18 @@ int main() {
     free(h_bk);
     free(h_bv);
     free(h_output);
+    free(h_output_unquant);
+    free(h_output_quant);
+    free(h_Wq_quant);
+    free(h_Wk_quant);
+    free(h_Wv_quant);
+    free(h_Wq_scales);
+    free(h_Wk_scales);
+    free(h_Wv_scales);
+    free(h_Wq_zeros);
+    free(h_Wk_zeros);
+    free(h_Wv_zeros);
+    
     CUDA_CHECK(cudaFree(d_X));
     CUDA_CHECK(cudaFree(d_Wq));
     CUDA_CHECK(cudaFree(d_Wk));
@@ -376,6 +700,15 @@ int main() {
     CUDA_CHECK(cudaFree(d_bk));
     CUDA_CHECK(cudaFree(d_bv));
     CUDA_CHECK(cudaFree(d_output));
+    CUDA_CHECK(cudaFree(d_Wq_quant));
+    CUDA_CHECK(cudaFree(d_Wk_quant));
+    CUDA_CHECK(cudaFree(d_Wv_quant));
+    CUDA_CHECK(cudaFree(d_Wq_scales));
+    CUDA_CHECK(cudaFree(d_Wk_scales));
+    CUDA_CHECK(cudaFree(d_Wv_scales));
+    CUDA_CHECK(cudaFree(d_Wq_zeros));
+    CUDA_CHECK(cudaFree(d_Wk_zeros));
+    CUDA_CHECK(cudaFree(d_Wv_zeros));
 
     printf("=== End of Test ===\n");
 
