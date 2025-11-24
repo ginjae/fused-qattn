@@ -10,7 +10,10 @@ TILED_SRC    = src/attn_tiled.cu src/quantization_utils.cu
 FLASH_TARGET = attn_flash
 FLASH_SRC    = src/attn_flash.cu src/quantization_utils.cu
 
-all: $(CHECK_TARGET) $(NAIVE_TARGET) $(TILED_TARGET) $(FLASH_TARGET)
+OURS_TARGET = attn_ours
+OURS_SRC    = src/attn_ours.cu src/quantization_utils.cu
+
+all: $(CHECK_TARGET) $(NAIVE_TARGET) $(TILED_TARGET) $(FLASH_TARGET) $(OURS_TARGET)
 
 $(CHECK_TARGET): $(CHECK_SRC)
 	nvcc -o $(CHECK_TARGET) $(CHECK_SRC)
@@ -23,6 +26,9 @@ $(TILED_TARGET): $(TILED_SRC)
 
 $(FLASH_TARGET): $(FLASH_SRC)
 	nvcc -o $(FLASH_TARGET) $(FLASH_SRC) -Isrc
+
+$(OURS_TARGET): $(OURS_SRC)
+	nvcc -o $(OURS_TARGET) $(OURS_SRC) -Isrc
 	
 run_check: $(CHECK_TARGET)
 	CUDA_VISIBLE_DEVICES=0 ./$(CHECK_TARGET)
@@ -36,5 +42,8 @@ run_tiled: $(TILED_TARGET)
 run_flash: $(FLASH_TARGET)
 	CUDA_VISIBLE_DEVICES=0 ./$(FLASH_TARGET)
 
+run_ours: $(OURS_TARGET)
+	CUDA_VISIBLE_DEVICES=0 ./$(OURS_TARGET)
+
 clean:
-	rm -f $(CHECK_TARGET) $(NAIVE_TARGET) $(TILED_TARGET) $(FLASH_TARGET)
+	rm -f $(CHECK_TARGET) $(NAIVE_TARGET) $(TILED_TARGET) $(FLASH_TARGET) $(OURS_TARGET)
