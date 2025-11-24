@@ -47,12 +47,14 @@ __global__ void dequantize_blockwise_kernel(
     }
 }
 
-// Kernel 0: Linear Projection (X·W + b)
+// Kernel 0: Tiled Linear Projection (X·W + b)
 // X: [batch, seq_len, d_model]
 // W: [d_model, d_out]
 // b: [d_out]
 // Output: [batch, seq_len, d_out]
-__global__ void linear_projection_kernel(
+#define TILE_SIZE 16
+
+__global__ void linear_projection_tiled_kernel(
     const float* X,
     const float* W,
     const float* b,
@@ -62,35 +64,59 @@ __global__ void linear_projection_kernel(
     int d_model,
     int d_out
 ) {
+    __shared__ float X_tile[TILE_SIZE][TILE_SIZE];
+    __shared__ float W_tile[TILE_SIZE][TILE_SIZE];
+
     int b_idx = blockIdx.z;
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
 
-    if (b_idx < batch && row < seq_len && col < d_out) {
-        float sum = 0.0f;
+    float sum = 0.0f;
 
-        // Compute dot product of X[b_idx, row, :] and W[:, col]
-        for (int k = 0; k < d_model; k++) {
-            int x_idx = b_idx * seq_len * d_model + row * d_model + k;
-            int w_idx = k * d_out + col;
-            sum += X[x_idx] * W[w_idx];
+    // Loop over tiles
+    for (int t = 0; t < (d_model + TILE_SIZE - 1) / TILE_SIZE; t++) {
+        // Load X tile
+        int x_row = row;
+        int x_col = t * TILE_SIZE + threadIdx.x;
+        if (b_idx < batch && x_row < seq_len && x_col < d_model) {
+            X_tile[threadIdx.y][threadIdx.x] = X[b_idx * seq_len * d_model + x_row * d_model + x_col];
+        } else {
+            X_tile[threadIdx.y][threadIdx.x] = 0.0f;
         }
 
-        // Add bias
+        // Load W tile
+        int w_row = t * TILE_SIZE + threadIdx.y;
+        int w_col = col;
+        if (w_row < d_model && w_col < d_out) {
+            W_tile[threadIdx.y][threadIdx.x] = W[w_row * d_out + w_col];
+        } else {
+            W_tile[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        __syncthreads();
+
+        // Compute partial dot product
+        for (int k = 0; k < TILE_SIZE; k++) {
+            sum += X_tile[threadIdx.y][k] * W_tile[k][threadIdx.x];
+        }
+
+        __syncthreads();
+    }
+
+    // Write result
+    if (b_idx < batch && row < seq_len && col < d_out) {
         if (b != nullptr) {
             sum += b[col];
         }
-
-        int out_idx = b_idx * seq_len * d_out + row * d_out + col;
-        output[out_idx] = sum;
+        output[b_idx * seq_len * d_out + row * d_out + col] = sum;
     }
 }
 
-// Kernel 1: Q·Kᵀ MatMul
+// Kernel 1: Tiled Q·K^T MatMul
 // Q: [batch, seq_len, d_k]
 // K: [batch, seq_len, d_k]
 // Output: [batch, seq_len, seq_len]
-__global__ void qk_matmul_kernel(
+__global__ void qk_matmul_tiled_kernel(
     const float* Q,
     const float* K,
     float* QK,
@@ -98,22 +124,48 @@ __global__ void qk_matmul_kernel(
     int seq_len,
     int d_k
 ) {
+    __shared__ float Q_tile[TILE_SIZE][TILE_SIZE];
+    __shared__ float K_tile[TILE_SIZE][TILE_SIZE];
+
     int b = blockIdx.z;
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
 
-    if (b < batch && row < seq_len && col < seq_len) {
-        float sum = 0.0f;
+    float sum = 0.0f;
 
-        // Compute dot product of Q[b, row, :] and K[b, col, :]
-        for (int k = 0; k < d_k; k++) {
-            int q_idx = b * seq_len * d_k + row * d_k + k;
-            int k_idx = b * seq_len * d_k + col * d_k + k;
-            sum += Q[q_idx] * K[k_idx];
+    // Loop over tiles
+    for (int t = 0; t < (d_k + TILE_SIZE - 1) / TILE_SIZE; t++) {
+        // Load Q tile
+        int q_row = row;
+        int q_col = t * TILE_SIZE + threadIdx.x;
+        if (b < batch && q_row < seq_len && q_col < d_k) {
+            Q_tile[threadIdx.y][threadIdx.x] = Q[b * seq_len * d_k + q_row * d_k + q_col];
+        } else {
+            Q_tile[threadIdx.y][threadIdx.x] = 0.0f;
         }
 
-        int out_idx = b * seq_len * seq_len + row * seq_len + col;
-        QK[out_idx] = sum;
+        // Load K tile (transposed)
+        int k_row = col;
+        int k_col = t * TILE_SIZE + threadIdx.y;
+        if (b < batch && k_row < seq_len && k_col < d_k) {
+            K_tile[threadIdx.y][threadIdx.x] = K[b * seq_len * d_k + k_row * d_k + k_col];
+        } else {
+            K_tile[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        __syncthreads();
+
+        // Compute partial dot product
+        for (int k = 0; k < TILE_SIZE; k++) {
+            sum += Q_tile[threadIdx.y][k] * K_tile[k][threadIdx.x];
+        }
+
+        __syncthreads();
+    }
+
+    // Write result
+    if (b < batch && row < seq_len && col < seq_len) {
+        QK[b * seq_len * seq_len + row * seq_len + col] = sum;
     }
 }
 
@@ -181,11 +233,11 @@ __global__ void softmax_kernel(
     }
 }
 
-// Kernel 4: Attention Score Application (A·V)
+// Kernel 4: Tiled Attention Score Application (A·V)
 // A: [batch, seq_len, seq_len] - attention scores
 // V: [batch, seq_len, d_v]
 // Output: [batch, seq_len, d_v]
-__global__ void av_matmul_kernel(
+__global__ void av_matmul_tiled_kernel(
     const float* A,
     const float* V,
     float* output,
@@ -193,22 +245,48 @@ __global__ void av_matmul_kernel(
     int seq_len,
     int d_v
 ) {
+    __shared__ float A_tile[TILE_SIZE][TILE_SIZE];
+    __shared__ float V_tile[TILE_SIZE][TILE_SIZE];
+
     int b = blockIdx.z;
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
 
-    if (b < batch && row < seq_len && col < d_v) {
-        float sum = 0.0f;
+    float sum = 0.0f;
 
-        // Compute dot product of A[b, row, :] and V[b, :, col]
-        for (int k = 0; k < seq_len; k++) {
-            int a_idx = b * seq_len * seq_len + row * seq_len + k;
-            int v_idx = b * seq_len * d_v + k * d_v + col;
-            sum += A[a_idx] * V[v_idx];
+    // Loop over tiles
+    for (int t = 0; t < (seq_len + TILE_SIZE - 1) / TILE_SIZE; t++) {
+        // Load A tile
+        int a_row = row;
+        int a_col = t * TILE_SIZE + threadIdx.x;
+        if (b < batch && a_row < seq_len && a_col < seq_len) {
+            A_tile[threadIdx.y][threadIdx.x] = A[b * seq_len * seq_len + a_row * seq_len + a_col];
+        } else {
+            A_tile[threadIdx.y][threadIdx.x] = 0.0f;
         }
 
-        int out_idx = b * seq_len * d_v + row * d_v + col;
-        output[out_idx] = sum;
+        // Load V tile
+        int v_row = t * TILE_SIZE + threadIdx.y;
+        int v_col = col;
+        if (b < batch && v_row < seq_len && v_col < d_v) {
+            V_tile[threadIdx.y][threadIdx.x] = V[b * seq_len * d_v + v_row * d_v + v_col];
+        } else {
+            V_tile[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        __syncthreads();
+
+        // Compute partial dot product
+        for (int k = 0; k < TILE_SIZE; k++) {
+            sum += A_tile[threadIdx.y][k] * V_tile[k][threadIdx.x];
+        }
+
+        __syncthreads();
+    }
+
+    // Write result
+    if (b < batch && row < seq_len && col < d_v) {
+        output[b * seq_len * d_v + row * d_v + col] = sum;
     }
 }
 
@@ -274,35 +352,35 @@ void naive_attention_quantized(
     CUDA_CHECK(cudaMalloc(&d_QK, batch * seq_len * seq_len * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_A, batch * seq_len * seq_len * sizeof(float)));
 
-    dim3 block_proj(16, 16);
+    dim3 block_proj(TILE_SIZE, TILE_SIZE);
 
-    // Step 0-1: Compute Q = X·Wq + bq (using dequantized weights)
-    dim3 grid_q((d_k + block_proj.x - 1) / block_proj.x,
-                (seq_len + block_proj.y - 1) / block_proj.y,
+    // Step 0-1: Compute Q = X·Wq + bq (using dequantized weights with tiled matmul)
+    dim3 grid_q((d_k + TILE_SIZE - 1) / TILE_SIZE,
+                (seq_len + TILE_SIZE - 1) / TILE_SIZE,
                 batch);
-    linear_projection_kernel<<<grid_q, block_proj>>>(d_X, d_Wq, d_bq, d_Q, batch, seq_len, d_model, d_k);
+    linear_projection_tiled_kernel<<<grid_q, block_proj>>>(d_X, d_Wq, d_bq, d_Q, batch, seq_len, d_model, d_k);
     CUDA_CHECK(cudaGetLastError());
 
-    // Step 0-2: Compute K = X·Wk + bk (using dequantized weights)
-    dim3 grid_k((d_k + block_proj.x - 1) / block_proj.x,
-                (seq_len + block_proj.y - 1) / block_proj.y,
+    // Step 0-2: Compute K = X·Wk + bk (using dequantized weights with tiled matmul)
+    dim3 grid_k((d_k + TILE_SIZE - 1) / TILE_SIZE,
+                (seq_len + TILE_SIZE - 1) / TILE_SIZE,
                 batch);
-    linear_projection_kernel<<<grid_k, block_proj>>>(d_X, d_Wk, d_bk, d_K, batch, seq_len, d_model, d_k);
+    linear_projection_tiled_kernel<<<grid_k, block_proj>>>(d_X, d_Wk, d_bk, d_K, batch, seq_len, d_model, d_k);
     CUDA_CHECK(cudaGetLastError());
 
-    // Step 0-3: Compute V = X·Wv + bv (using dequantized weights)
-    dim3 grid_v((d_v + block_proj.x - 1) / block_proj.x,
-                (seq_len + block_proj.y - 1) / block_proj.y,
+    // Step 0-3: Compute V = X·Wv + bv (using dequantized weights with tiled matmul)
+    dim3 grid_v((d_v + TILE_SIZE - 1) / TILE_SIZE,
+                (seq_len + TILE_SIZE - 1) / TILE_SIZE,
                 batch);
-    linear_projection_kernel<<<grid_v, block_proj>>>(d_X, d_Wv, d_bv, d_V, batch, seq_len, d_model, d_v);
+    linear_projection_tiled_kernel<<<grid_v, block_proj>>>(d_X, d_Wv, d_bv, d_V, batch, seq_len, d_model, d_v);
     CUDA_CHECK(cudaGetLastError());
 
-    // Step 1: Q·Kᵀ MatMul
-    dim3 block1(16, 16);
-    dim3 grid1((seq_len + block1.x - 1) / block1.x,
-               (seq_len + block1.y - 1) / block1.y,
+    // Step 1: Q·Kᵀ MatMul with tiling
+    dim3 block1(TILE_SIZE, TILE_SIZE);
+    dim3 grid1((seq_len + TILE_SIZE - 1) / TILE_SIZE,
+               (seq_len + TILE_SIZE - 1) / TILE_SIZE,
                batch);
-    qk_matmul_kernel<<<grid1, block1>>>(d_Q, d_K, d_QK, batch, seq_len, d_k);
+    qk_matmul_tiled_kernel<<<grid1, block1>>>(d_Q, d_K, d_QK, batch, seq_len, d_k);
     CUDA_CHECK(cudaGetLastError());
 
     // Step 2: Scaling + Masking
@@ -321,7 +399,7 @@ void naive_attention_quantized(
     dim3 grid3((d_v + block3.x - 1) / block3.x,
                (seq_len + block3.y - 1) / block3.y,
                batch);
-    av_matmul_kernel<<<grid3, block3>>>(d_A, d_V, d_output, batch, seq_len, d_v);
+    av_matmul_tiled_kernel<<<grid3, block3>>>(d_A, d_V, d_output, batch, seq_len, d_v);
     CUDA_CHECK(cudaGetLastError());
 
     // Free temporary buffers
@@ -361,35 +439,35 @@ void naive_attention(
     CUDA_CHECK(cudaMalloc(&d_QK, batch * seq_len * seq_len * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_A, batch * seq_len * seq_len * sizeof(float)));
 
-    dim3 block_proj(16, 16);
+    dim3 block_proj(TILE_SIZE, TILE_SIZE);
 
-    // Step 0-1: Compute Q = X·Wq + bq
-    dim3 grid_q((d_k + block_proj.x - 1) / block_proj.x,
-                (seq_len + block_proj.y - 1) / block_proj.y,
+    // Step 0-1: Compute Q = X·Wq + bq with tiled matmul
+    dim3 grid_q((d_k + TILE_SIZE - 1) / TILE_SIZE,
+                (seq_len + TILE_SIZE - 1) / TILE_SIZE,
                 batch);
-    linear_projection_kernel<<<grid_q, block_proj>>>(d_X, d_Wq, d_bq, d_Q, batch, seq_len, d_model, d_k);
+    linear_projection_tiled_kernel<<<grid_q, block_proj>>>(d_X, d_Wq, d_bq, d_Q, batch, seq_len, d_model, d_k);
     CUDA_CHECK(cudaGetLastError());
 
-    // Step 0-2: Compute K = X·Wk + bk
-    dim3 grid_k((d_k + block_proj.x - 1) / block_proj.x,
-                (seq_len + block_proj.y - 1) / block_proj.y,
+    // Step 0-2: Compute K = X·Wk + bk with tiled matmul
+    dim3 grid_k((d_k + TILE_SIZE - 1) / TILE_SIZE,
+                (seq_len + TILE_SIZE - 1) / TILE_SIZE,
                 batch);
-    linear_projection_kernel<<<grid_k, block_proj>>>(d_X, d_Wk, d_bk, d_K, batch, seq_len, d_model, d_k);
+    linear_projection_tiled_kernel<<<grid_k, block_proj>>>(d_X, d_Wk, d_bk, d_K, batch, seq_len, d_model, d_k);
     CUDA_CHECK(cudaGetLastError());
 
-    // Step 0-3: Compute V = X·Wv + bv
-    dim3 grid_v((d_v + block_proj.x - 1) / block_proj.x,
-                (seq_len + block_proj.y - 1) / block_proj.y,
+    // Step 0-3: Compute V = X·Wv + bv with tiled matmul
+    dim3 grid_v((d_v + TILE_SIZE - 1) / TILE_SIZE,
+                (seq_len + TILE_SIZE - 1) / TILE_SIZE,
                 batch);
-    linear_projection_kernel<<<grid_v, block_proj>>>(d_X, d_Wv, d_bv, d_V, batch, seq_len, d_model, d_v);
+    linear_projection_tiled_kernel<<<grid_v, block_proj>>>(d_X, d_Wv, d_bv, d_V, batch, seq_len, d_model, d_v);
     CUDA_CHECK(cudaGetLastError());
 
-    // Step 1: Q·Kᵀ MatMul
-    dim3 block1(16, 16);
-    dim3 grid1((seq_len + block1.x - 1) / block1.x,
-               (seq_len + block1.y - 1) / block1.y,
+    // Step 1: Q·Kᵀ MatMul with tiling
+    dim3 block1(TILE_SIZE, TILE_SIZE);
+    dim3 grid1((seq_len + TILE_SIZE - 1) / TILE_SIZE,
+               (seq_len + TILE_SIZE - 1) / TILE_SIZE,
                batch);
-    qk_matmul_kernel<<<grid1, block1>>>(d_Q, d_K, d_QK, batch, seq_len, d_k);
+    qk_matmul_tiled_kernel<<<grid1, block1>>>(d_Q, d_K, d_QK, batch, seq_len, d_k);
     CUDA_CHECK(cudaGetLastError());
 
     // Step 2: Scaling + Masking
@@ -408,7 +486,7 @@ void naive_attention(
     dim3 grid3((d_v + block3.x - 1) / block3.x,
                (seq_len + block3.y - 1) / block3.y,
                batch);
-    av_matmul_kernel<<<grid3, block3>>>(d_A, d_V, d_output, batch, seq_len, d_v);
+    av_matmul_tiled_kernel<<<grid3, block3>>>(d_A, d_V, d_output, batch, seq_len, d_v);
     CUDA_CHECK(cudaGetLastError());
 
     // Free temporary buffers
@@ -431,7 +509,7 @@ int main() {
     int d_v = 64;
     int block_size = 64; // Block size for quantization
 
-    printf("=== Starting Test: Naive Attention with Quantization (GPT-2 Scale) ===");
+    printf("=== Starting Test: Tiled Attention with Quantization (GPT-2 Scale) ===");
 
     // Allocate and initialize host memory for input and weights
     size_t x_size = batch * seq_len * d_model * sizeof(float);
@@ -507,8 +585,8 @@ int main() {
     CUDA_CHECK(cudaEventCreate(&stop));
     float elapsed_time_unquant, elapsed_time_quant;
 
-    // Test 1: Naive attention with original (unquantized) weights
-    printf("\n=== Test 1: Naive Attention (Unquantized Weights) ===\n");
+    // Test 1: Tiled attention with original (unquantized) weights
+    printf("\n=== Test 1: Tiled Attention (Unquantized Weights) ===\n");
     
     // Dummy run to warm up GPU
     printf("Running dummy run for warm-up...\n");
@@ -573,8 +651,8 @@ int main() {
     printf("Num blocks (Q/K): %d, Num blocks (V): %d\n", num_blocks_q, num_blocks_v);
     printf("Quantization complete.\n");
     
-    // Test 2: Naive attention with quantized weights (GPU dequantization)
-    printf("\n=== Test 2: Naive Attention (Quantized Weights) ===\n");
+    // Test 2: Tiled attention with quantized weights (GPU dequantization)
+    printf("\n=== Test 2: Tiled Attention (Quantized Weights) ===\n");
     
     // Allocate device memory for quantized weights
     int8_t *d_Wq_quant, *d_Wk_quant, *d_Wv_quant;
