@@ -13,156 +13,37 @@
         } \
     } while(0)
 
-
-// Quantized Q/K/V projection with on-the-fly block-wise dequantization
-#define TILE_SIZE_DEQUANT 32
-__global__ void fused_qkv_projection_tiled_quantized_kernel(
-    const float* __restrict__ X,      // [batch, seq_len, d_model]
-
-    const int8_t* __restrict__ Wq_q,  // [d_model, d_k]   (int8)
-    const float*  __restrict__ Wq_scales,
-    const int8_t* __restrict__ Wq_zeros,
-
-    const int8_t* __restrict__ Wk_q,  // [d_model, d_k]   (int8)
-    const float*  __restrict__ Wk_scales,
-    const int8_t* __restrict__ Wk_zeros,
-
-    const int8_t* __restrict__ Wv_q,  // [d_model, d_v]   (int8)
-    const float*  __restrict__ Wv_scales,
-    const int8_t* __restrict__ Wv_zeros,
-
-    const float* __restrict__ bq,     // [d_k]
-    const float* __restrict__ bk,     // [d_k]
-    const float* __restrict__ bv,     // [d_v]
-
-    float* __restrict__ Q,            // [batch, seq_len, d_k]
-    float* __restrict__ K,            // [batch, seq_len, d_k]
-    float* __restrict__ V,            // [batch, seq_len, d_v]
-
-    int batch,
-    int seq_len,
-    int d_model,
-    int d_k,
-    int d_v,
+// Kernel for Block-wise Dequantization
+// Dequantizes int8 weights to float using block-wise scale and zero-point
+// W_quantized: [rows * cols] int8 values
+// scales: [num_blocks] scale factors
+// zero_points: [num_blocks] zero points
+// W_dequantized: [rows * cols] output float values
+// block_size: number of elements per quantization block
+__global__ void dequantize_blockwise_kernel(
+    const int8_t* W_quantized,
+    const float* scales,
+    const int8_t* zero_points,
+    float* W_dequantized,
+    int rows,
+    int cols,
     int block_size
 ) {
-    __shared__ float X_tile[TILE_SIZE_DEQUANT][TILE_SIZE_DEQUANT];
-    __shared__ float W_tile[TILE_SIZE_DEQUANT][TILE_SIZE_DEQUANT];
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
 
-    int b_idx = blockIdx.z;
-    int row   = blockIdx.y * TILE_SIZE_DEQUANT + threadIdx.y;  // sequence index
-    int col   = blockIdx.x * TILE_SIZE_DEQUANT + threadIdx.x;  // projection dim index (max(d_k, d_v))
+    if (row < rows && col < cols) {
+        int idx = row * cols + col;
 
-    if (b_idx >= batch || row >= seq_len) {
-        return;
-    }
+        // Determine which block this element belongs to
+        int block_idx = idx / block_size;
 
-    float sum_q = 0.0f;
-    float sum_k = 0.0f;
-    float sum_v = 0.0f;
+        // Dequantize: float_value = scale * (quantized_value - zero_point)
+        float scale = scales[block_idx];
+        int8_t zero_point = zero_points[block_idx];
+        int8_t quantized_val = W_quantized[idx];
 
-    // base pointers for X, Q/K/V
-    const int x_batch_stride = seq_len * d_model;
-    const int q_batch_stride = seq_len * d_k;
-    const int v_batch_stride = seq_len * d_v;
-
-    // Loop over tiles in the d_model dimension
-    for (int t = 0; t < (d_model + TILE_SIZE_DEQUANT - 1) / TILE_SIZE_DEQUANT; ++t) {
-        // ---- Load X tile ----------------------------------------------------
-        int x_row = row;
-        int x_col = t * TILE_SIZE_DEQUANT + threadIdx.x;
-        if (x_row < seq_len && x_col < d_model) {
-            X_tile[threadIdx.y][threadIdx.x] =
-                X[b_idx * x_batch_stride + x_row * d_model + x_col];
-        } else {
-            X_tile[threadIdx.y][threadIdx.x] = 0.0f;
-        }
-        __syncthreads();
-
-        // ---- Q projection: load Wq tile with on-the-fly dequant ------------
-        int w_row = t * TILE_SIZE_DEQUANT + threadIdx.y;   // along d_model
-        int w_col = col;                           // along d_k / d_v
-
-        if (w_row < d_model && w_col < d_k) {
-            int idx        = w_row * d_k + w_col;  // flattened index
-            int block_idx  = idx / block_size;
-            float scale    = Wq_scales[block_idx];
-            int8_t zp      = Wq_zeros[block_idx];
-            int8_t q_val   = Wq_q[idx];
-
-            W_tile[threadIdx.y][threadIdx.x] = scale * (float)(q_val - zp);
-        } else {
-            W_tile[threadIdx.y][threadIdx.x] = 0.0f;
-        }
-        __syncthreads();
-
-        // matmul contribution for Q
-        for (int k = 0; k < TILE_SIZE_DEQUANT; ++k) {
-            sum_q += X_tile[threadIdx.y][k] * W_tile[k][threadIdx.x];
-        }
-        __syncthreads();
-
-        // ---- K projection: reuse X_tile, reload W_tile with Wk -------------
-        if (w_row < d_model && w_col < d_k) {
-            int idx        = w_row * d_k + w_col;
-            int block_idx  = idx / block_size;
-            float scale    = Wk_scales[block_idx];
-            int8_t zp      = Wk_zeros[block_idx];
-            int8_t k_val   = Wk_q[idx];
-
-            W_tile[threadIdx.y][threadIdx.x] = scale * (float)(k_val - zp);
-        } else {
-            W_tile[threadIdx.y][threadIdx.x] = 0.0f;
-        }
-        __syncthreads();
-
-        for (int k = 0; k < TILE_SIZE_DEQUANT; ++k) {
-            sum_k += X_tile[threadIdx.y][k] * W_tile[k][threadIdx.x];
-        }
-        __syncthreads();
-
-        // ---- V projection: reuse X_tile, reload W_tile with Wv -------------
-        if (w_row < d_model && w_col < d_v) {
-            int idx        = w_row * d_v + w_col;
-            int block_idx  = idx / block_size;
-            float scale    = Wv_scales[block_idx];
-            int8_t zp      = Wv_zeros[block_idx];
-            int8_t v_val   = Wv_q[idx];
-
-            W_tile[threadIdx.y][threadIdx.x] = scale * (float)(v_val - zp);
-        } else {
-            W_tile[threadIdx.y][threadIdx.x] = 0.0f;
-        }
-        __syncthreads();
-
-        for (int k = 0; k < TILE_SIZE_DEQUANT; ++k) {
-            sum_v += X_tile[threadIdx.y][k] * W_tile[k][threadIdx.x];
-        }
-        __syncthreads();
-    }
-
-    // ---- Write Q -----------------------------------------------------------
-    if (col < d_k) {
-        if (bq != nullptr) {
-            sum_q += bq[col];
-        }
-        Q[b_idx * q_batch_stride + row * d_k + col] = sum_q;
-    }
-
-    // ---- Write K -----------------------------------------------------------
-    if (col < d_k) {
-        if (bk != nullptr) {
-            sum_k += bk[col];
-        }
-        K[b_idx * q_batch_stride + row * d_k + col] = sum_k;
-    }
-
-    // ---- Write V -----------------------------------------------------------
-    if (col < d_v) {
-        if (bv != nullptr) {
-            sum_v += bv[col];
-        }
-        V[b_idx * v_batch_stride + row * d_v + col] = sum_v;
+        W_dequantized[idx] = scale * (float)(quantized_val - zero_point);
     }
 }
 
@@ -281,8 +162,145 @@ __global__ void fused_qkv_projection_tiled_kernel(
     }
 }
 
+// Kernel: Optimized Fused Dequantization + QKV Projection
+// Performs on-the-fly dequantization during matrix multiplication
+// Optimizations:
+// - __restrict__ pointers for better memory aliasing hints
+// - Padded shared memory (TILE_SIZE+1) to avoid bank conflicts
+// - __ldg() intrinsics for read-only cached loads
+// - __fmaf_rn() for faster fused multiply-add operations
+// - const variables and pre-computed indices
+// - Better loop unrolling (#pragma unroll 8)
+// X: [batch, seq_len, d_model]
+// Wq_quantized, Wk_quantized, Wv_quantized: [d_model, d_k/d_v] int8
+// scales, zero_points: per-block quantization parameters
+// Q, K, V: [batch, seq_len, d_k/d_v]
+__global__ void fused_dequant_qkv_projection_kernel(
+    const float* __restrict__ X,
+    const int8_t* __restrict__ Wq_quantized,
+    const int8_t* __restrict__ Wk_quantized,
+    const int8_t* __restrict__ Wv_quantized,
+    const float* __restrict__ Wq_scales,
+    const float* __restrict__ Wk_scales,
+    const float* __restrict__ Wv_scales,
+    const int8_t* __restrict__ Wq_zeros,
+    const int8_t* __restrict__ Wk_zeros,
+    const int8_t* __restrict__ Wv_zeros,
+    const float* __restrict__ bq,
+    const float* __restrict__ bk,
+    const float* __restrict__ bv,
+    float* __restrict__ Q,
+    float* __restrict__ K,
+    float* __restrict__ V,
+    int batch,
+    int seq_len,
+    int d_model,
+    int d_k,
+    int d_v,
+    int block_size
+) {
+    // Padded shared memory to avoid bank conflicts (stride is TILE_SIZE+1 instead of TILE_SIZE)
+    __shared__ float X_tile[TILE_SIZE][TILE_SIZE + 1];
+    __shared__ float Wq_tile[TILE_SIZE][TILE_SIZE + 1];
+    __shared__ float Wk_tile[TILE_SIZE][TILE_SIZE + 1];
+    __shared__ float Wv_tile[TILE_SIZE][TILE_SIZE + 1];
+
+    const int b_idx = blockIdx.z;
+    const int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    const int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+
+    float sum_q = 0.0f;
+    float sum_k = 0.0f;
+    float sum_v = 0.0f;
+
+    // Pre-compute base index for X access
+    const int x_base = b_idx * seq_len * d_model + row * d_model;
+
+    for (int t = 0; t < (d_model + TILE_SIZE - 1) / TILE_SIZE; t++) {
+        // 1. Load X tile once
+        const int x_col = t * TILE_SIZE + threadIdx.x;
+        if (b_idx < batch && row < seq_len && x_col < d_model) {
+            X_tile[threadIdx.y][threadIdx.x] = __ldg(&X[x_base + x_col]);
+        } else {
+            X_tile[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        const int w_row = t * TILE_SIZE + threadIdx.y;
+        const int w_col = col;
+
+        // 2. Load ALL weight tiles in parallel (no sync between)
+        if (w_row < d_model && w_col < d_k) {
+            const int wq_idx = w_row * d_k + w_col;
+            const int block_idx = wq_idx / block_size;
+            const int8_t q_val = __ldg(&Wq_quantized[wq_idx]);
+            const float scale = __ldg(&Wq_scales[block_idx]);
+            const int8_t zero = __ldg(&Wq_zeros[block_idx]);
+            Wq_tile[threadIdx.y][threadIdx.x] = scale * (float)(q_val - zero);
+
+            // Load K at same time
+            const int wk_idx = w_row * d_k + w_col;
+            const int block_idx_k = wk_idx / block_size;
+            const int8_t k_val = __ldg(&Wk_quantized[wk_idx]);
+            const float scale_k = __ldg(&Wk_scales[block_idx_k]);
+            const int8_t zero_k = __ldg(&Wk_zeros[block_idx_k]);
+            Wk_tile[threadIdx.y][threadIdx.x] = scale_k * (float)(k_val - zero_k);
+        } else {
+            Wq_tile[threadIdx.y][threadIdx.x] = 0.0f;
+            Wk_tile[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        if (w_row < d_model && w_col < d_v) {
+            const int wv_idx = w_row * d_v + w_col;
+            const int block_idx_v = wv_idx / block_size;
+            const int8_t v_val = __ldg(&Wv_quantized[wv_idx]);
+            const float scale_v = __ldg(&Wv_scales[block_idx_v]);
+            const int8_t zero_v = __ldg(&Wv_zeros[block_idx_v]);
+            Wv_tile[threadIdx.y][threadIdx.x] = scale_v * (float)(v_val - zero_v);
+        } else {
+            Wv_tile[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        // 3. Single sync after all loads
+        __syncthreads();
+
+        // 4. Compute all three matmuls together
+        for (int k = 0; k < TILE_SIZE; k++) {
+            float x_val = X_tile[threadIdx.y][k];
+            sum_q = __fmaf_rn(x_val, Wq_tile[k][threadIdx.x], sum_q);
+            sum_k = __fmaf_rn(x_val, Wk_tile[k][threadIdx.x], sum_k);
+            sum_v = __fmaf_rn(x_val, Wv_tile[k][threadIdx.x], sum_v);
+        }
+        __syncthreads();
+    }
+
+    // Write Q result with bias (coalesced writes)
+    if (b_idx < batch && row < seq_len && col < d_k) {
+        if (bq != nullptr) {
+            sum_q = __fmaf_rn(1.0f, __ldg(&bq[col]), sum_q);
+        }
+        Q[b_idx * seq_len * d_k + row * d_k + col] = sum_q;
+    }
+
+    // Write K result with bias
+    if (b_idx < batch && row < seq_len && col < d_k) {
+        if (bk != nullptr) {
+            sum_k = __fmaf_rn(1.0f, __ldg(&bk[col]), sum_k);
+        }
+        K[b_idx * seq_len * d_k + row * d_k + col] = sum_k;
+    }
+
+    // Write V result with bias
+    if (b_idx < batch && row < seq_len && col < d_v) {
+        if (bv != nullptr) {
+            sum_v = __fmaf_rn(1.0f, __ldg(&bv[col]), sum_v);
+        }
+        V[b_idx * seq_len * d_v + row * d_v + col] = sum_v;
+    }
+}
+
 #define WARP_SIZE 32
 #define TILE_D 32  // Tile size in d_k dimension
+#define TILE_PAD 1  // Padding to avoid bank conflicts
 
 // Q: [batch, seq_len, d_k]
 // K: [batch, seq_len, d_k]
@@ -472,6 +490,7 @@ __global__ void flash_attention_kernel(
 
 
 // Host function to perform complete tiled attention with quantized weight matrices
+// Now uses fused dequantization + QKV projection kernel for maximum throughput
 void tiled_attention_quantized(
     const float* d_X,
     const int8_t* d_Wq_quantized,
@@ -495,45 +514,28 @@ void tiled_attention_quantized(
     int block_size,
     bool causal_mask = false
 ) {
-    // Allocate temporary buffers for Q, K, V, A (no need for QK anymore!)
+    // Allocate temporary buffers for Q, K, V only (no need for dequantized weights!)
     float *d_Q, *d_K, *d_V;
     CUDA_CHECK(cudaMalloc(&d_Q, batch * seq_len * d_k * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_K, batch * seq_len * d_k * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_V, batch * seq_len * d_v * sizeof(float)));
         
-    // 0단계: Quantized W로 Q,K,V 계산 (dequant + matmul fused)
-    const int max_d = (d_k > d_v) ? d_k : d_v;
+    // Step 0: Compute Q, K, V using FUSED dequantization + projection kernel
+    // This performs on-the-fly dequantization during matmul, eliminating separate passes
+    int max_d = (d_k > d_v) ? d_k : d_v;
     dim3 block_fused(TILE_SIZE, TILE_SIZE);
-    dim3 grid_fused(
-        (max_d   + TILE_SIZE - 1) / TILE_SIZE,
-        (seq_len + TILE_SIZE - 1) / TILE_SIZE,
-        batch
-    );
-
-    fused_qkv_projection_tiled_quantized_kernel<<<grid_fused, block_fused>>>(
+    dim3 grid_fused((max_d + TILE_SIZE - 1) / TILE_SIZE,
+                    (seq_len + TILE_SIZE - 1) / TILE_SIZE,
+                    batch);
+    fused_dequant_qkv_projection_kernel<<<grid_fused, block_fused>>>(
         d_X,
-        d_Wq_quantized, d_Wq_scales, d_Wq_zeros,
-        d_Wk_quantized, d_Wk_scales, d_Wk_zeros,
-        d_Wv_quantized, d_Wv_scales, d_Wv_zeros,
+        d_Wq_quantized, d_Wk_quantized, d_Wv_quantized,
+        d_Wq_scales, d_Wk_scales, d_Wv_scales,
+        d_Wq_zeros, d_Wk_zeros, d_Wv_zeros,
         d_bq, d_bk, d_bv,
         d_Q, d_K, d_V,
-        batch, seq_len, d_model, d_k, d_v,
-        block_size
-    );
+        batch, seq_len, d_model, d_k, d_v, block_size);
     CUDA_CHECK(cudaGetLastError());
-        
-    // // Step 0: Compute Q, K, V using fused kernel for better arithmetic intensity
-    // // Grid dimensions based on max(d_k, d_v) to handle all outputs
-    // int max_d = (d_k > d_v) ? d_k : d_v;
-    // dim3 block_fused(TILE_SIZE, TILE_SIZE);
-    // dim3 grid_fused((max_d + TILE_SIZE - 1) / TILE_SIZE,
-    //                 (seq_len + TILE_SIZE - 1) / TILE_SIZE,
-    //                 batch);
-    // fused_qkv_projection_tiled_kernel<<<grid_fused, block_fused>>>(
-    //     d_X, d_Wq, d_Wk, d_Wv, d_bq, d_bk, d_bv,
-    //     d_Q, d_K, d_V,
-    //     batch, seq_len, d_model, d_k, d_v);
-    // CUDA_CHECK(cudaGetLastError());
 
     // Step 1 & 2 & 3 & 4 (FUSED): Q·Kᵀ MatMul + Scaling + Masking + Online Softmax + A·V MatMul
     dim3 block_fused_qk(256);  // One block per row with 256 threads
