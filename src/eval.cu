@@ -36,6 +36,45 @@ void print_output_sample(const char* label, float* output, int seq_len, int d_v)
     }
 }
 
+// Function to compute error metrics between two outputs
+void compute_error_metrics(const char* label, float* output_ref, float* output_test, 
+                          int batch, int seq_len, int d_v) {
+    int total_elements = batch * seq_len * d_v;
+    double max_abs_error = 0.0;
+    double sum_abs_error = 0.0;
+    double sum_squared_error = 0.0;
+    double sum_ref_squared = 0.0;
+    
+    for (int i = 0; i < total_elements; i++) {
+        double diff = fabs(output_test[i] - output_ref[i]);
+        max_abs_error = fmax(max_abs_error, diff);
+        sum_abs_error += diff;
+        sum_squared_error += diff * diff;
+        sum_ref_squared += output_ref[i] * output_ref[i];
+    }
+    
+    double mean_abs_error = sum_abs_error / total_elements;
+    double rmse = sqrt(sum_squared_error / total_elements);
+    double relative_error = sqrt(sum_squared_error / sum_ref_squared);
+    
+    printf("  %s Correctness Check:\n", label);
+    printf("    Max Absolute Error: %.6e\n", max_abs_error);
+    printf("    Mean Absolute Error: %.6e\n", mean_abs_error);
+    printf("    RMSE: %.6e\n", rmse);
+    printf("    Relative Error: %.6e\n", relative_error);
+    
+    // Determine if the result is acceptable (you can adjust threshold)
+    if (max_abs_error < 1e-3 && relative_error < 1e-3) {
+        printf("    Status: ✓ PASS (High precision match)\n");
+    } else if (max_abs_error < 1e-2 && relative_error < 1e-2) {
+        printf("    Status: ✓ PASS (Acceptable precision)\n");
+    } else if (max_abs_error < 1e-1 && relative_error < 1e-1) {
+        printf("    Status: ⚠ WARNING (Lower precision)\n");
+    } else {
+        printf("    Status: ✗ FAIL (Significant error)\n");
+    }
+}
+
 
 int main() {
     // Test parameters (GPT-2 small scale)
@@ -114,6 +153,7 @@ int main() {
     CUDA_CHECK(cudaMemcpy(d_bv, h_bv, bv_size, cudaMemcpyHostToDevice));
 
     // Allocate output buffers for both tests
+    float* h_output_naive_baseline = (float*)malloc(out_size);  // Baseline for comparison
     float* h_output_unquant = (float*)malloc(out_size);
     float* h_output_quant = (float*)malloc(out_size);
 
@@ -123,8 +163,8 @@ int main() {
     CUDA_CHECK(cudaEventCreate(&stop));
     float elapsed_time_unquant, elapsed_time_quant;
 
-    // Test 1: Tiled attention with original (unquantized) weights
-    printf("\n1. Naive Attention\n");
+    // Test 1: Naive attention with original (unquantized) weights - BASELINE
+    printf("\n1. Naive Attention (BASELINE)\n");
 
     // Dummy run to warm up GPU
     printf("Running dummy run for warm-up...\n");
@@ -143,11 +183,11 @@ int main() {
     CUDA_CHECK(cudaEventSynchronize(stop));
     CUDA_CHECK(cudaEventElapsedTime(&elapsed_time_unquant, start, stop));
 
-    // Copy result back
-    CUDA_CHECK(cudaMemcpy(h_output_unquant, d_output, out_size, cudaMemcpyDeviceToHost));
+    // Copy result back as baseline
+    CUDA_CHECK(cudaMemcpy(h_output_naive_baseline, d_output, out_size, cudaMemcpyDeviceToHost));
 
     // Print results (first 3 and last 3 positions only)
-    // print_output_sample("Output (Unquantized)", h_output_unquant, seq_len, d_v);
+    // print_output_sample("Output (Unquantized)", h_output_naive_baseline, seq_len, d_v);
     printf("Execution time: %.4f ms\n", elapsed_time_unquant);
 
 
@@ -177,10 +217,14 @@ int main() {
     // Print results (first 3 and last 3 positions only)
     // print_output_sample("Output (Unquantized)", h_output_unquant, seq_len, d_v);
     printf("Execution time: %.4f ms\n", elapsed_time_unquant);
+    
+    // Compare with baseline
+    compute_error_metrics("Tiled vs Naive", h_output_naive_baseline, h_output_unquant, 
+                         batch, seq_len, d_v);
 
 
     // Test 3: Flash-style attention with original (unquantized) weights
-    printf("\n3.Flash-style Attention\n");
+    printf("\n3. Flash-style Attention\n");
 
     // Dummy run to warm up GPU
     printf("Running dummy run for warm-up...\n");
@@ -205,6 +249,11 @@ int main() {
     // Print results (first 3 and last 3 positions only)
     // print_output_sample("Output (Unquantized)", h_output_unquant, seq_len, d_v);
     printf("Execution time: %.4f ms\n", elapsed_time_unquant);
+    
+    // Compare with baseline
+    compute_error_metrics("Flash vs Naive", h_output_naive_baseline, h_output_unquant, 
+                         batch, seq_len, d_v);
+    
     printf("=== End of Test ===\n");
 
     printf("\n");
@@ -267,7 +316,7 @@ int main() {
     CUDA_CHECK(cudaMemcpy(d_Wv_zeros, h_Wv_zeros, num_blocks_v * sizeof(int8_t), cudaMemcpyHostToDevice));
 
 
-    printf("\n1. Naive Attention\n");
+    printf("\n1. Naive Attention (Quantized)\n");
     // Dummy run to warm up GPU
     printf("Running dummy run for warm-up...\n");
     naive_attention_quantized(d_X, 
@@ -302,9 +351,13 @@ int main() {
     // Print quantized results (first 3 and last 3 positions only)
     // print_output_sample("Output (Quantized)", h_output_quant, seq_len, d_v);
     printf("Execution time: %.4f ms\n", elapsed_time_quant);
+    
+    // Compare with baseline
+    compute_error_metrics("Naive Quantized vs Naive Baseline", h_output_naive_baseline, h_output_quant, 
+                         batch, seq_len, d_v);
 
 
-    printf("\n2. Tiled Attention\n");
+    printf("\n2. Tiled Attention (Quantized)\n");
     // Dummy run to warm up GPU
     printf("Running dummy run for warm-up...\n");
     tiled_attention_quantized(d_X, 
@@ -339,9 +392,13 @@ int main() {
     // Print quantized results (first 3 and last 3 positions only)
     // print_output_sample("Output (Quantized)", h_output_quant, seq_len, d_v);
     printf("Execution time: %.4f ms\n", elapsed_time_quant);
+    
+    // Compare with baseline
+    compute_error_metrics("Tiled Quantized vs Naive Baseline", h_output_naive_baseline, h_output_quant, 
+                         batch, seq_len, d_v);
 
 
-    printf("\n3. Flash-style Attention\n");
+    printf("\n3. Flash-style Attention (Quantized)\n");
     // Dummy run to warm up GPU
     printf("Running dummy run for warm-up...\n");
     flash_attention_quantized(d_X, 
@@ -376,9 +433,13 @@ int main() {
     // Print quantized results (first 3 and last 3 positions only)
     // print_output_sample("Output (Quantized)", h_output_quant, seq_len, d_v);
     printf("Execution time: %.4f ms\n", elapsed_time_quant);
+    
+    // Compare with baseline
+    compute_error_metrics("Flash Quantized vs Naive Baseline", h_output_naive_baseline, h_output_quant, 
+                         batch, seq_len, d_v);
 
 
-    printf("\n4. Our Attention\n");
+    printf("\n4. Our Attention (Quantized)\n");
     // Dummy run to warm up GPU
     printf("Running dummy run for warm-up...\n");
     our_attention_quantized(d_X, 
@@ -413,6 +474,10 @@ int main() {
     // Print quantized results (first 3 and last 3 positions only)
     // print_output_sample("Output (Quantized)", h_output_quant, seq_len, d_v);
     printf("Execution time: %.4f ms\n", elapsed_time_quant);
+    
+    // Compare with baseline
+    compute_error_metrics("Our Quantized vs Naive Baseline", h_output_naive_baseline, h_output_quant, 
+                         batch, seq_len, d_v);
 
 
     // Cleanup CUDA events
@@ -428,6 +493,7 @@ int main() {
     free(h_bk);
     free(h_bv);
     free(h_output);
+    free(h_output_naive_baseline);
     free(h_output_unquant);
     free(h_output_quant);
     free(h_Wq_quant);
