@@ -1,0 +1,43 @@
+CUDA_VISIBLE_DEVICES=0 ./eval
+
+=== Starting Evaluation (GPT-2 Scale, Unquantized weights) ===
+
+== Initializing Weights ==
+
+1. Naive Attention
+Running dummy run for warm-up...
+Execution time: 0.2773 ms
+
+2. Tiled Attention
+Running dummy run for warm-up...
+Execution time: 0.1842 ms
+
+3.Flash-style Attention
+Running dummy run for warm-up...
+Execution time: 0.1563 ms
+=== End of Test ===
+
+
+=== Starting Evaluation (GPT-2 Scale, Quantized weights) ===
+
+== Quantizing Weights ==
+Block size: 64
+Num blocks (Q/K): 768, Num blocks (V): 768
+Quantization complete.
+
+1. Naive Attention
+Running dummy run for warm-up...
+Execution time: 0.2788 ms
+
+2. Tiled Attention
+Running dummy run for warm-up...
+Execution time: 0.2028 ms
+
+3. Flash-style Attention
+Running dummy run for warm-up...
+Execution time: 0.1959 ms
+
+4. Our Attention
+Running dummy run for warm-up...
+Execution time: 0.1699 ms
+=== End of Test ===
