@@ -3,56 +3,11 @@
 #include <math.h>
 #include "quantization_utils.cuh"
 
-#define CUDA_CHECK(call) \
-    do { \
-        cudaError_t err = call; \
-        if (err != cudaSuccess) { \
-            fprintf(stderr, "CUDA error in %s:%d: %s\n", __FILE__, __LINE__, \
-                    cudaGetErrorString(err)); \
-            exit(EXIT_FAILURE); \
-        } \
-    } while(0)
-
-// Kernel for Block-wise Dequantization
-// Dequantizes int8 weights to float using block-wise scale and zero-point
-// W_quantized: [rows * cols] int8 values
-// scales: [num_blocks] scale factors
-// zero_points: [num_blocks] zero points
-// W_dequantized: [rows * cols] output float values
-// block_size: number of elements per quantization block
-static __global__ void dequantize_blockwise_kernel(
-    const int8_t* W_quantized,
-    const float* scales,
-    const int8_t* zero_points,
-    float* W_dequantized,
-    int rows,
-    int cols,
-    int block_size
-) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (row < rows && col < cols) {
-        int idx = row * cols + col;
-
-        // Determine which block this element belongs to
-        int block_idx = idx / block_size;
-
-        // Dequantize: float_value = scale * (quantized_value - zero_point)
-        float scale = scales[block_idx];
-        int8_t zero_point = zero_points[block_idx];
-        int8_t quantized_val = W_quantized[idx];
-
-        W_dequantized[idx] = scale * (float)(quantized_val - zero_point);
-    }
-}
-
 // Kernel 0: Tiled Linear Projection (X·W + b)
 // X: [batch, seq_len, d_model]
 // W: [d_model, d_out]
 // b: [d_out]
 // Output: [batch, seq_len, d_out]
-#define TILE_SIZE 16
 
 static __global__ void linear_projection_tiled_kernel(
     const float* X,
