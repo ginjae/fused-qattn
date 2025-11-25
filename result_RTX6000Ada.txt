@@ -6,15 +6,15 @@ CUDA_VISIBLE_DEVICES=0 ./eval
 
 1. Naive Attention
 Running dummy run for warm-up...
-Execution time: 0.2773 ms
+Execution time: 0.1403 ms
 
 2. Tiled Attention
 Running dummy run for warm-up...
-Execution time: 0.1842 ms
+Execution time: 0.0768 ms
 
 3.Flash-style Attention
 Running dummy run for warm-up...
-Execution time: 0.1563 ms
+Execution time: 0.0647 ms
 === End of Test ===
 
 
@@ -27,17 +27,17 @@ Quantization complete.
 
 1. Naive Attention
 Running dummy run for warm-up...
-Execution time: 0.2788 ms
+Execution time: 0.1475 ms
 
 2. Tiled Attention
 Running dummy run for warm-up...
-Execution time: 0.2028 ms
+Execution time: 0.0873 ms
 
 3. Flash-style Attention
 Running dummy run for warm-up...
-Execution time: 0.1959 ms
+Execution time: 0.0758 ms
 
 4. Our Attention
 Running dummy run for warm-up...
-Execution time: 0.1699 ms
+Execution time: 0.0717 ms
 === End of Test ===
