@@ -1,5 +1,2 @@
 cuda_healthcheck
-attn_naive
-attn_tiled
-attn_flash
-attn_ours
+eval
