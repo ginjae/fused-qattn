@@ -2,21 +2,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <unistd.h>
+#include <algorithm>
 #include "quantization_utils.cuh"
 #include "attn_naive.cuh"
 #include "attn_tiled.cuh"
 #include "attn_flash.cuh"
 #include "attn_ours.cuh"
 
-#define CUDA_CHECK(call) \
-    do { \
-        cudaError_t err = call; \
-        if (err != cudaSuccess) { \
-            fprintf(stderr, "CUDA error in %s:%d: %s\n", __FILE__, __LINE__, \
-                    cudaGetErrorString(err)); \
-            exit(EXIT_FAILURE); \
-        } \
-    } while(0)
+#define NUM_ITERATIONS 100
+#define COOLDOWN_SECONDS 3  // seconds to wait between tests
+
 
 void print_output_sample(const char* label, float* output, int seq_len, int d_v) {
     printf("%s - showing first 3 and last 3 positions:\n", label);
@@ -73,6 +69,23 @@ void compute_error_metrics(const char* label, float* output_ref, float* output_t
     } else {
         printf("    Status: ✗ FAIL (Significant error)\n");
     }
+}
+
+// Function to compute median from array of floats
+float compute_median(float* times, int n) {
+    std::sort(times, times + n);
+    if (n % 2 == 0) {
+        return (times[n/2 - 1] + times[n/2]) / 2.0f;
+    } else {
+        return times[n/2];
+    }
+}
+
+// Function to wait for GPU to cool down
+void cooldown_gpu(int seconds) {
+    printf("Cooling down GPU for %d seconds...\n", seconds);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    sleep(seconds);
 }
 
 
@@ -162,7 +175,9 @@ int main() {
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
     float elapsed_time_unquant, elapsed_time_quant;
+    float* iteration_times = (float*)malloc(NUM_ITERATIONS * sizeof(float));
 
+    cooldown_gpu(COOLDOWN_SECONDS);
     // Test 1: Naive attention with original (unquantized) weights - BASELINE
     printf("\n1. Naive Attention (BASELINE)\n");
 
@@ -172,25 +187,27 @@ int main() {
                     d_output, batch, seq_len, d_model, d_k, d_v, true);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Start timing
-    CUDA_CHECK(cudaEventRecord(start));
-
-    naive_attention(d_X, d_Wq, d_Wk, d_Wv, d_bq, d_bk, d_bv, 
-                    d_output, batch, seq_len, d_model, d_k, d_v, true);
-
-    // Stop timing
-    CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    CUDA_CHECK(cudaEventElapsedTime(&elapsed_time_unquant, start, stop));
+    // Run multiple iterations
+    printf("Running %d iterations...\n", NUM_ITERATIONS);
+    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
+        CUDA_CHECK(cudaEventRecord(start));
+        naive_attention(d_X, d_Wq, d_Wk, d_Wv, d_bq, d_bk, d_bv, 
+                        d_output, batch, seq_len, d_model, d_k, d_v, true);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
+    }
+    elapsed_time_unquant = compute_median(iteration_times, NUM_ITERATIONS);
 
     // Copy result back as baseline
     CUDA_CHECK(cudaMemcpy(h_output_naive_baseline, d_output, out_size, cudaMemcpyDeviceToHost));
 
     // Print results (first 3 and last 3 positions only)
     // print_output_sample("Output (Unquantized)", h_output_naive_baseline, seq_len, d_v);
-    printf("Execution time: %.4f ms\n", elapsed_time_unquant);
+    printf("Median execution time: %.4f ms\n", elapsed_time_unquant);
 
 
+    cooldown_gpu(COOLDOWN_SECONDS);
     // Test 2: Tiled attention with original (unquantized) weights
     printf("\n2. Tiled Attention\n");
 
@@ -200,29 +217,31 @@ int main() {
                     d_output, batch, seq_len, d_model, d_k, d_v, true);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Start timing
-    CUDA_CHECK(cudaEventRecord(start));
-
-    tiled_attention(d_X, d_Wq, d_Wk, d_Wv, d_bq, d_bk, d_bv, 
-                    d_output, batch, seq_len, d_model, d_k, d_v, true);
-
-    // Stop timing
-    CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    CUDA_CHECK(cudaEventElapsedTime(&elapsed_time_unquant, start, stop));
+    // Run multiple iterations
+    printf("Running %d iterations...\n", NUM_ITERATIONS);
+    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
+        CUDA_CHECK(cudaEventRecord(start));
+        tiled_attention(d_X, d_Wq, d_Wk, d_Wv, d_bq, d_bk, d_bv, 
+                        d_output, batch, seq_len, d_model, d_k, d_v, true);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
+    }
+    elapsed_time_unquant = compute_median(iteration_times, NUM_ITERATIONS);
 
     // Copy result back
     CUDA_CHECK(cudaMemcpy(h_output_unquant, d_output, out_size, cudaMemcpyDeviceToHost));
 
     // Print results (first 3 and last 3 positions only)
     // print_output_sample("Output (Unquantized)", h_output_unquant, seq_len, d_v);
-    printf("Execution time: %.4f ms\n", elapsed_time_unquant);
+    printf("Median execution time: %.4f ms\n", elapsed_time_unquant);
     
     // Compare with baseline
     compute_error_metrics("Tiled vs Naive", h_output_naive_baseline, h_output_unquant, 
                          batch, seq_len, d_v);
 
 
+    cooldown_gpu(COOLDOWN_SECONDS);
     // Test 3: Flash-style attention with original (unquantized) weights
     printf("\n3. Flash-style Attention\n");
 
@@ -232,23 +251,24 @@ int main() {
                     d_output, batch, seq_len, d_model, d_k, d_v, true);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Start timing
-    CUDA_CHECK(cudaEventRecord(start));
-
-    flash_attention(d_X, d_Wq, d_Wk, d_Wv, d_bq, d_bk, d_bv, 
-                    d_output, batch, seq_len, d_model, d_k, d_v, true);
-
-    // Stop timing
-    CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    CUDA_CHECK(cudaEventElapsedTime(&elapsed_time_unquant, start, stop));
+    // Run multiple iterations
+    printf("Running %d iterations...\n", NUM_ITERATIONS);
+    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
+        CUDA_CHECK(cudaEventRecord(start));
+        flash_attention(d_X, d_Wq, d_Wk, d_Wv, d_bq, d_bk, d_bv, 
+                        d_output, batch, seq_len, d_model, d_k, d_v, true);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
+    }
+    elapsed_time_unquant = compute_median(iteration_times, NUM_ITERATIONS);
 
     // Copy result back
     CUDA_CHECK(cudaMemcpy(h_output_unquant, d_output, out_size, cudaMemcpyDeviceToHost));
 
     // Print results (first 3 and last 3 positions only)
     // print_output_sample("Output (Unquantized)", h_output_unquant, seq_len, d_v);
-    printf("Execution time: %.4f ms\n", elapsed_time_unquant);
+    printf("Median execution time: %.4f ms\n", elapsed_time_unquant);
     
     // Compare with baseline
     compute_error_metrics("Flash vs Naive", h_output_naive_baseline, h_output_unquant, 
@@ -316,6 +336,7 @@ int main() {
     CUDA_CHECK(cudaMemcpy(d_Wv_zeros, h_Wv_zeros, num_blocks_v * sizeof(int8_t), cudaMemcpyHostToDevice));
 
 
+    cooldown_gpu(COOLDOWN_SECONDS);
     printf("\n1. Naive Attention (Quantized)\n");
     // Dummy run to warm up GPU
     printf("Running dummy run for warm-up...\n");
@@ -328,35 +349,36 @@ int main() {
                               block_size, true);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Start timing
-    CUDA_CHECK(cudaEventRecord(start));
-
-    // Run quantized attention
-    naive_attention_quantized_blockwise(d_X, 
-                              d_Wq_quant, d_Wk_quant, d_Wv_quant,
-                              d_Wq_scales, d_Wk_scales, d_Wv_scales,
-                              d_Wq_zeros, d_Wk_zeros, d_Wv_zeros,
-                              d_bq, d_bk, d_bv,
-                              d_output, batch, seq_len, d_model, d_k, d_v,
-                              block_size, true);
-
-    // Stop timing
-    CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    CUDA_CHECK(cudaEventElapsedTime(&elapsed_time_quant, start, stop));
+    // Run multiple iterations
+    printf("Running %d iterations...\n", NUM_ITERATIONS);
+    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
+        CUDA_CHECK(cudaEventRecord(start));
+        naive_attention_quantized_blockwise(d_X, 
+                                  d_Wq_quant, d_Wk_quant, d_Wv_quant,
+                                  d_Wq_scales, d_Wk_scales, d_Wv_scales,
+                                  d_Wq_zeros, d_Wk_zeros, d_Wv_zeros,
+                                  d_bq, d_bk, d_bv,
+                                  d_output, batch, seq_len, d_model, d_k, d_v,
+                                  block_size, true);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
+    }
+    elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
 
     // Copy quantized result back
     CUDA_CHECK(cudaMemcpy(h_output_quant, d_output, out_size, cudaMemcpyDeviceToHost));
 
     // Print quantized results (first 3 and last 3 positions only)
     // print_output_sample("Output (Quantized)", h_output_quant, seq_len, d_v);
-    printf("Execution time: %.4f ms\n", elapsed_time_quant);
+    printf("Median execution time: %.4f ms\n", elapsed_time_quant);
     
     // Compare with baseline
     compute_error_metrics("Naive Quantized vs Naive Baseline", h_output_naive_baseline, h_output_quant, 
                          batch, seq_len, d_v);
 
 
+    cooldown_gpu(COOLDOWN_SECONDS);
     printf("\n2. Tiled Attention (Quantized)\n");
     // Dummy run to warm up GPU
     printf("Running dummy run for warm-up...\n");
@@ -369,35 +391,36 @@ int main() {
                               block_size, true);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Start timing
-    CUDA_CHECK(cudaEventRecord(start));
-
-    // Run quantized attention
-    tiled_attention_quantized_blockwise(d_X, 
-                              d_Wq_quant, d_Wk_quant, d_Wv_quant,
-                              d_Wq_scales, d_Wk_scales, d_Wv_scales,
-                              d_Wq_zeros, d_Wk_zeros, d_Wv_zeros,
-                              d_bq, d_bk, d_bv,
-                              d_output, batch, seq_len, d_model, d_k, d_v,
-                              block_size, true);
-
-    // Stop timing
-    CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    CUDA_CHECK(cudaEventElapsedTime(&elapsed_time_quant, start, stop));
+    // Run multiple iterations
+    printf("Running %d iterations...\n", NUM_ITERATIONS);
+    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
+        CUDA_CHECK(cudaEventRecord(start));
+        tiled_attention_quantized_blockwise(d_X, 
+                                  d_Wq_quant, d_Wk_quant, d_Wv_quant,
+                                  d_Wq_scales, d_Wk_scales, d_Wv_scales,
+                                  d_Wq_zeros, d_Wk_zeros, d_Wv_zeros,
+                                  d_bq, d_bk, d_bv,
+                                  d_output, batch, seq_len, d_model, d_k, d_v,
+                                  block_size, true);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
+    }
+    elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
 
     // Copy quantized result back
     CUDA_CHECK(cudaMemcpy(h_output_quant, d_output, out_size, cudaMemcpyDeviceToHost));
 
     // Print quantized results (first 3 and last 3 positions only)
     // print_output_sample("Output (Quantized)", h_output_quant, seq_len, d_v);
-    printf("Execution time: %.4f ms\n", elapsed_time_quant);
+    printf("Median execution time: %.4f ms\n", elapsed_time_quant);
     
     // Compare with baseline
     compute_error_metrics("Tiled Quantized vs Naive Baseline", h_output_naive_baseline, h_output_quant, 
                          batch, seq_len, d_v);
 
 
+    cooldown_gpu(COOLDOWN_SECONDS);
     printf("\n3. Flash-style Attention (Quantized)\n");
     // Dummy run to warm up GPU
     printf("Running dummy run for warm-up...\n");
@@ -410,35 +433,36 @@ int main() {
                               block_size, true);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Start timing
-    CUDA_CHECK(cudaEventRecord(start));
-
-    // Run quantized attention
-    flash_attention_quantized_blockwise(d_X, 
-                              d_Wq_quant, d_Wk_quant, d_Wv_quant,
-                              d_Wq_scales, d_Wk_scales, d_Wv_scales,
-                              d_Wq_zeros, d_Wk_zeros, d_Wv_zeros,
-                              d_bq, d_bk, d_bv,
-                              d_output, batch, seq_len, d_model, d_k, d_v,
-                              block_size, true);
-
-    // Stop timing
-    CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    CUDA_CHECK(cudaEventElapsedTime(&elapsed_time_quant, start, stop));
+    // Run multiple iterations
+    printf("Running %d iterations...\n", NUM_ITERATIONS);
+    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
+        CUDA_CHECK(cudaEventRecord(start));
+        flash_attention_quantized_blockwise(d_X, 
+                                  d_Wq_quant, d_Wk_quant, d_Wv_quant,
+                                  d_Wq_scales, d_Wk_scales, d_Wv_scales,
+                                  d_Wq_zeros, d_Wk_zeros, d_Wv_zeros,
+                                  d_bq, d_bk, d_bv,
+                                  d_output, batch, seq_len, d_model, d_k, d_v,
+                                  block_size, true);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
+    }
+    elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
 
     // Copy quantized result back
     CUDA_CHECK(cudaMemcpy(h_output_quant, d_output, out_size, cudaMemcpyDeviceToHost));
 
     // Print quantized results (first 3 and last 3 positions only)
     // print_output_sample("Output (Quantized)", h_output_quant, seq_len, d_v);
-    printf("Execution time: %.4f ms\n", elapsed_time_quant);
+    printf("Median execution time: %.4f ms\n", elapsed_time_quant);
     
     // Compare with baseline
     compute_error_metrics("Flash Quantized vs Naive Baseline", h_output_naive_baseline, h_output_quant, 
                          batch, seq_len, d_v);
 
 
+    cooldown_gpu(COOLDOWN_SECONDS);
     printf("\n4. Our Attention (Quantized)\n");
     // Dummy run to warm up GPU
     printf("Running dummy run for warm-up...\n");
@@ -451,29 +475,29 @@ int main() {
                               block_size, true);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Start timing
-    CUDA_CHECK(cudaEventRecord(start));
-
-    // Run quantized attention
-    our_attention_quantized_blockwise(d_X, 
-                              d_Wq_quant, d_Wk_quant, d_Wv_quant,
-                              d_Wq_scales, d_Wk_scales, d_Wv_scales,
-                              d_Wq_zeros, d_Wk_zeros, d_Wv_zeros,
-                              d_bq, d_bk, d_bv,
-                              d_output, batch, seq_len, d_model, d_k, d_v,
-                              block_size, true);
-
-    // Stop timing
-    CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    CUDA_CHECK(cudaEventElapsedTime(&elapsed_time_quant, start, stop));
+    // Run multiple iterations
+    printf("Running %d iterations...\n", NUM_ITERATIONS);
+    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
+        CUDA_CHECK(cudaEventRecord(start));
+        our_attention_quantized_blockwise(d_X, 
+                                  d_Wq_quant, d_Wk_quant, d_Wv_quant,
+                                  d_Wq_scales, d_Wk_scales, d_Wv_scales,
+                                  d_Wq_zeros, d_Wk_zeros, d_Wv_zeros,
+                                  d_bq, d_bk, d_bv,
+                                  d_output, batch, seq_len, d_model, d_k, d_v,
+                                  block_size, true);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
+    }
+    elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
 
     // Copy quantized result back
     CUDA_CHECK(cudaMemcpy(h_output_quant, d_output, out_size, cudaMemcpyDeviceToHost));
 
     // Print quantized results (first 3 and last 3 positions only)
     // print_output_sample("Output (Quantized)", h_output_quant, seq_len, d_v);
-    printf("Execution time: %.4f ms\n", elapsed_time_quant);
+    printf("Median execution time: %.4f ms\n", elapsed_time_quant);
     
     // Compare with baseline
     compute_error_metrics("Our Quantized vs Naive Baseline", h_output_naive_baseline, h_output_quant, 
@@ -485,6 +509,7 @@ int main() {
     CUDA_CHECK(cudaEventDestroy(stop));
 
     // Cleanup
+    free(iteration_times);
     free(h_X);
     free(h_Wq);
     free(h_Wk);
