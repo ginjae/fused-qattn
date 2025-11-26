@@ -83,24 +83,72 @@ __host__ __device__ inline uint8_t float_to_fp4_mantissa(float value, int shared
     int exp = ((bits >> 23) & 0xFF) - 127; // Unbias exponent
     uint32_t mantissa = bits & 0x7FFFFF;
     
+    // OCP Spec requires roundTiesToEven (banker's rounding)
+    // For 1-bit mantissa quantization, we check bit 22 (target) and bit 21 (first discarded bit)
+    // Round up if: bit21=1 AND (bit22=1 OR any lower bit is 1)
+    uint32_t target_bit = (mantissa >> 22) & 0x1;
+    uint32_t guard_bit = (mantissa >> 21) & 0x1;
+    uint32_t sticky_bits = mantissa & 0x1FFFFF; // All bits below guard bit
+    
+    // roundTiesToEven: round to nearest, ties to even
+    if (guard_bit) {
+        if (sticky_bits != 0 || target_bit == 1) {
+            // Round up: either not a tie (sticky!=0) or tie to even (target=1, want to go to 0)
+            mantissa += 0x400000; // Add to bit 22
+            if (mantissa & 0x800000) {
+                // Overflow into implicit bit, increment exponent
+                mantissa = 0;
+                exp++;
+            }
+        }
+        // else: exact tie with target_bit=0 (already even), round down (do nothing)
+    }
+    
     // Adjust based on shared exponent
     int exp_diff = exp - shared_exp;
     
-    // FP4: 1 sign bit + 2 exp bits + 1 mantissa bit
-    // Exponent range: -2 to +1 (relative to shared exponent)
-    uint8_t fp4_exp;
-    if (exp_diff < -2) {
-        fp4_exp = 0; // Underflow, set to smallest
-        mantissa = 0;
-    } else if (exp_diff > 1) {
-        fp4_exp = 3; // Overflow, set to largest
-        mantissa = 0x7FFFFF;
-    } else {
-        fp4_exp = exp_diff + 2; // Map [-2, 1] to [0, 3]
-    }
+    // OCP FP4 (E2M1) Encoding per Table 5:
+    // exp_bits mapping with bias=1:
+    //   11 (3) -> actual_exp = 3-1 = 2  -> represents values with exp = shared_exp + 2
+    //   10 (2) -> actual_exp = 2-1 = 1  -> represents values with exp = shared_exp + 1
+    //   01 (1) -> actual_exp = 1-1 = 0  -> represents values with exp = shared_exp + 0
+    //   00 (0) -> subnormal, exp = 0    -> represents values with exp = shared_exp - 1 (as 0.5×2^0 = 1.0×2^-1)
     
-    // Extract top mantissa bit
-    uint8_t fp4_mantissa = (mantissa >> 22) & 0x1;
+    uint8_t fp4_exp;
+    uint8_t fp4_mantissa;
+    
+    if (exp_diff > 2) {
+        // Overflow: Clamp to max normal (OCP Spec Section 5.3.3)
+        fp4_exp = 3;         // 11
+        fp4_mantissa = 1;    // Max: 1.1_2 × 2^2 = 6.0
+    } else if (exp_diff >= 0) {
+        // Normal range: map [0, 1, 2] to [01, 10, 11]
+        fp4_exp = exp_diff + 1;
+        fp4_mantissa = (mantissa >> 22) & 0x1;
+    } else if (exp_diff == -1) {
+        // Subnormal range: Convert 1.m × 2^(shared_exp-1) → 0.M × 2^shared_exp
+        // Example: 1.0 × 2^-1 = 0.5 → FP4 subnormal 0.1 × 2^0, so M=1
+        //          1.1 × 2^-1 = 0.75 → FP4 subnormal 0.1 × 2^0, so M=1 (rounded)
+        fp4_exp = 0;  // 00
+        
+        // Reconstruct full mantissa (implicit 1 + fractional bits)
+        // full_mantissa = 1.mantissa_bits
+        // To convert to subnormal: 1.m × 2^-1 = 0.(1m) × 2^0
+        // So we need to check if (1 + mantissa/2^23) * 0.5 >= 0.5
+        // Simplified: always set to 1 for values in [0.5, 1.0) before scaling
+        // More precisely: check if rounded value >= 0.75 (would round to 1.0)
+        
+        // After rounding, if the value is >= 0.75, it should round up to 1.0 (next normal)
+        // But we're in exp_diff == -1, meaning post-rounding it's still < 1.0
+        // So for subnormal: 0.5 ≤ val < 1.0 → M = 1
+        // Values < 0.5 are already flushed to zero (exp_diff < -1)
+        
+        fp4_mantissa = 1;  // Subnormal in [0.5, 1.0) → 0.1 × 2^shared_exp
+    } else {
+        // Underflow: exp_diff < -1, flush to zero (OCP Spec Section 5.3.3)
+        fp4_exp = 0;
+        fp4_mantissa = 0;  // Zero: S 00 0
+    }
     
     // Combine: [sign:1][exp:2][mantissa:1]
     return (sign << 3) | (fp4_exp << 1) | fp4_mantissa;
@@ -108,21 +156,42 @@ __host__ __device__ inline uint8_t float_to_fp4_mantissa(float value, int shared
 
 // Helper function to convert FP4 mantissa back to float
 __host__ __device__ inline float fp4_mantissa_to_float(uint8_t fp4_val, int shared_exp) {
-    if (fp4_val == 0) return 0.0f;
-    
-    // Extract components
+    // Extract components: [S:1][E:2][M:1]
     uint8_t sign = (fp4_val >> 3) & 0x1;
     uint8_t exp_bits = (fp4_val >> 1) & 0x3;
     uint8_t mantissa_bit = fp4_val & 0x1;
     
-    // Compute actual exponent
-    int relative_exp = (int)exp_bits - 2; // Map [0,3] back to [-2,1]
+    // OCP FP4 (E2M1) Decoding per Table 5:
+    // Format: val = (-1)^S × 2^(E-bias) × (1.M) for normal
+    //         val = (-1)^S × 2^(1-bias) × (0.M) for subnormal (E=0)
+    // bias = 1
+    
+    if (exp_bits == 0 && mantissa_bit == 0) {
+        // Zero: S 00 0 → ±0.0
+        return 0.0f;
+    }
+    
+    int relative_exp;
+    uint32_t mantissa;
+    
+    if (exp_bits == 0) {
+        // Subnormal: S 00 1 → ±0.5 (before scaling by shared_exp)
+        // Formula: (-1)^S × 2^(1-1) × (0 + 2^-1 × 1) = (-1)^S × 0.5
+        // We represent 0.5 as 1.0 × 2^-1 in IEEE 754
+        relative_exp = -1;
+        mantissa = (1 << 23);  // 1.0 (no fractional bits)
+    } else {
+        // Normal: exp_bits ∈ {1,2,3}
+        // E=1 (01) → 2^(1-1) = 2^0  → relative_exp = 0
+        // E=2 (10) → 2^(2-1) = 2^1  → relative_exp = 1
+        // E=3 (11) → 2^(3-1) = 2^2  → relative_exp = 2
+        relative_exp = (int)exp_bits - 1;
+        mantissa = (1 << 23) | (mantissa_bit << 22);  // 1.mantissa_bit
+    }
+    
     int actual_exp = shared_exp + relative_exp;
     
-    // Build mantissa (1.mantissa_bit in binary)
-    uint32_t mantissa = (1 << 23) | (mantissa_bit << 22);
-    
-    // Construct float
+    // Construct IEEE 754 float
     uint32_t result_bits = (sign << 31) | ((actual_exp + 127) << 23) | (mantissa & 0x7FFFFF);
     return *reinterpret_cast<float*>(&result_bits);
 }
@@ -146,11 +215,22 @@ void quantize_mxfp4(
             if (abs_val > max_abs) max_abs = abs_val;
         }
         
-        // Compute shared exponent
-        int shared_exp = 0;
+        // Compute shared exponent per OCP Spec Section 6.3:
+        // X = largest power-of-two <= max(|v_i|) / largest power-of-two representable in element
+        // For FP4 (E2M1), largest representable power-of-two = 2^2 = 4
+        // Therefore: X = floor_pow2(max_abs) / 4 = 2^(exp_of_max - 2)
+        int shared_exp = -127;
         if (max_abs > 0.0f) {
             uint32_t bits = *reinterpret_cast<uint32_t*>(&max_abs);
-            shared_exp = ((bits >> 23) & 0xFF) - 127;
+            int exp_of_max = ((bits >> 23) & 0xFF) - 127;
+            
+            // OCP-compliant: Shift down by 2 to account for FP4 max exponent of 2
+            // This ensures scaled values fall within FP4 range [0.5, 6.0]
+            shared_exp = exp_of_max - 2;
+            
+            // Clamp to valid E8M0 range [-127, 127]
+            if (shared_exp < -127) shared_exp = -127;
+            if (shared_exp > 127) shared_exp = 127;
         }
         
         quantized_blocks[b].shared_exp = (uint8_t)(shared_exp + 127); // Store biased exponent
