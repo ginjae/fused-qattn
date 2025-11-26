@@ -21,7 +21,7 @@ void tiled_attention(
     bool verbose
 );
 
-void tiled_attention_quantized(
+void tiled_attention_quantized_blockwise(
     const float* X,
     const int8_t* Wq_quantized,
     const int8_t* Wk_quantized,

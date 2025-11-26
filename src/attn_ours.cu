@@ -196,7 +196,7 @@ static __global__ void our_attention_kernel(
 
 // Host function to perform complete tiled attention with quantized weight matrices
 // Now uses fused dequantization + QKV projection kernel for maximum throughput
-void our_attention_quantized(
+void our_attention_quantized_blockwise(
     const float* d_X,
     const int8_t* d_Wq_quantized,
     const int8_t* d_Wk_quantized,

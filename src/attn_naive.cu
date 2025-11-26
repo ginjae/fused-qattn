@@ -130,7 +130,7 @@ static __global__ void av_matmul_kernel(
 }
 
 // Host function to perform complete naive attention with quantized weight matrices
-void naive_attention_quantized(
+void naive_attention_quantized_blockwise(
     const float* d_X,
     const int8_t* d_Wq_quantized,
     const int8_t* d_Wk_quantized,

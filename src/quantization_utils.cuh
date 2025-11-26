@@ -58,6 +58,17 @@ __global__ void linear_projection_kernel(
     int d_out
 );
 
+__global__ void linear_projection_tiled_kernel(
+    const float* X,
+    const float* W,
+    const float* b,
+    float* output,
+    int batch,
+    int seq_len,
+    int d_model,
+    int d_out
+);
+
 __global__ void fused_qkv_projection_tiled_kernel(
     const float* X,
     const float* Wq,

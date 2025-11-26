@@ -136,6 +136,69 @@ __global__ void linear_projection_kernel(
     }
 }
 
+// Kernel 0: Tiled Linear Projection (X·W + b)
+// X: [batch, seq_len, d_model]
+// W: [d_model, d_out]
+// b: [d_out]
+// Output: [batch, seq_len, d_out]
+__global__ void linear_projection_tiled_kernel(
+    const float* X,
+    const float* W,
+    const float* b,
+    float* output,
+    int batch,
+    int seq_len,
+    int d_model,
+    int d_out
+) {
+    __shared__ float X_tile[TILE_SIZE][TILE_SIZE];
+    __shared__ float W_tile[TILE_SIZE][TILE_SIZE];
+
+    int b_idx = blockIdx.z;
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+
+    float sum = 0.0f;
+
+    // Loop over tiles
+    for (int t = 0; t < (d_model + TILE_SIZE - 1) / TILE_SIZE; t++) {
+        // Load X tile
+        int x_row = row;
+        int x_col = t * TILE_SIZE + threadIdx.x;
+        if (b_idx < batch && x_row < seq_len && x_col < d_model) {
+            X_tile[threadIdx.y][threadIdx.x] = X[b_idx * seq_len * d_model + x_row * d_model + x_col];
+        } else {
+            X_tile[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        // Load W tile
+        int w_row = t * TILE_SIZE + threadIdx.y;
+        int w_col = col;
+        if (w_row < d_model && w_col < d_out) {
+            W_tile[threadIdx.y][threadIdx.x] = W[w_row * d_out + w_col];
+        } else {
+            W_tile[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        __syncthreads();
+
+        // Compute partial dot product
+        for (int k = 0; k < TILE_SIZE; k++) {
+            sum += X_tile[threadIdx.y][k] * W_tile[k][threadIdx.x];
+        }
+
+        __syncthreads();
+    }
+
+    // Write result
+    if (b_idx < batch && row < seq_len && col < d_out) {
+        if (b != nullptr) {
+            sum += b[col];
+        }
+        output[b_idx * seq_len * d_out + row * d_out + col] = sum;
+    }
+}
+
 // Kernel 0: Fused & Tiled Linear Projection for Q, K, V
 // Computes [Q|K|V] = X·[W_Q|W_K|W_V] + [b_Q|b_K|b_V] in a single kernel
 // This improves arithmetic intensity by loading X once for all three projections

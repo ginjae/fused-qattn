@@ -169,14 +169,14 @@ int main() {
     // Dummy run to warm up GPU
     printf("Running dummy run for warm-up...\n");
     naive_attention(d_X, d_Wq, d_Wk, d_Wv, d_bq, d_bk, d_bv, 
-                    d_output, batch, seq_len, d_model, d_k, d_v, false);
+                    d_output, batch, seq_len, d_model, d_k, d_v, true);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Start timing
     CUDA_CHECK(cudaEventRecord(start));
 
     naive_attention(d_X, d_Wq, d_Wk, d_Wv, d_bq, d_bk, d_bv, 
-                    d_output, batch, seq_len, d_model, d_k, d_v, false);
+                    d_output, batch, seq_len, d_model, d_k, d_v, true);
 
     // Stop timing
     CUDA_CHECK(cudaEventRecord(stop));
@@ -197,14 +197,14 @@ int main() {
     // Dummy run to warm up GPU
     printf("Running dummy run for warm-up...\n");
     tiled_attention(d_X, d_Wq, d_Wk, d_Wv, d_bq, d_bk, d_bv, 
-                    d_output, batch, seq_len, d_model, d_k, d_v, false);
+                    d_output, batch, seq_len, d_model, d_k, d_v, true);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Start timing
     CUDA_CHECK(cudaEventRecord(start));
 
     tiled_attention(d_X, d_Wq, d_Wk, d_Wv, d_bq, d_bk, d_bv, 
-                    d_output, batch, seq_len, d_model, d_k, d_v, false);
+                    d_output, batch, seq_len, d_model, d_k, d_v, true);
 
     // Stop timing
     CUDA_CHECK(cudaEventRecord(stop));
@@ -229,14 +229,14 @@ int main() {
     // Dummy run to warm up GPU
     printf("Running dummy run for warm-up...\n");
     flash_attention(d_X, d_Wq, d_Wk, d_Wv, d_bq, d_bk, d_bv, 
-                    d_output, batch, seq_len, d_model, d_k, d_v, false);
+                    d_output, batch, seq_len, d_model, d_k, d_v, true);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Start timing
     CUDA_CHECK(cudaEventRecord(start));
 
     flash_attention(d_X, d_Wq, d_Wk, d_Wv, d_bq, d_bk, d_bv, 
-                    d_output, batch, seq_len, d_model, d_k, d_v, false);
+                    d_output, batch, seq_len, d_model, d_k, d_v, true);
 
     // Stop timing
     CUDA_CHECK(cudaEventRecord(stop));
@@ -319,26 +319,26 @@ int main() {
     printf("\n1. Naive Attention (Quantized)\n");
     // Dummy run to warm up GPU
     printf("Running dummy run for warm-up...\n");
-    naive_attention_quantized(d_X, 
+    naive_attention_quantized_blockwise(d_X, 
                               d_Wq_quant, d_Wk_quant, d_Wv_quant,
                               d_Wq_scales, d_Wk_scales, d_Wv_scales,
                               d_Wq_zeros, d_Wk_zeros, d_Wv_zeros,
                               d_bq, d_bk, d_bv,
                               d_output, batch, seq_len, d_model, d_k, d_v,
-                              block_size, false);
+                              block_size, true);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Start timing
     CUDA_CHECK(cudaEventRecord(start));
 
     // Run quantized attention
-    naive_attention_quantized(d_X, 
+    naive_attention_quantized_blockwise(d_X, 
                               d_Wq_quant, d_Wk_quant, d_Wv_quant,
                               d_Wq_scales, d_Wk_scales, d_Wv_scales,
                               d_Wq_zeros, d_Wk_zeros, d_Wv_zeros,
                               d_bq, d_bk, d_bv,
                               d_output, batch, seq_len, d_model, d_k, d_v,
-                              block_size, false);
+                              block_size, true);
 
     // Stop timing
     CUDA_CHECK(cudaEventRecord(stop));
@@ -360,26 +360,26 @@ int main() {
     printf("\n2. Tiled Attention (Quantized)\n");
     // Dummy run to warm up GPU
     printf("Running dummy run for warm-up...\n");
-    tiled_attention_quantized(d_X, 
+    tiled_attention_quantized_blockwise(d_X, 
                               d_Wq_quant, d_Wk_quant, d_Wv_quant,
                               d_Wq_scales, d_Wk_scales, d_Wv_scales,
                               d_Wq_zeros, d_Wk_zeros, d_Wv_zeros,
                               d_bq, d_bk, d_bv,
                               d_output, batch, seq_len, d_model, d_k, d_v,
-                              block_size, false);
+                              block_size, true);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Start timing
     CUDA_CHECK(cudaEventRecord(start));
 
     // Run quantized attention
-    tiled_attention_quantized(d_X, 
+    tiled_attention_quantized_blockwise(d_X, 
                               d_Wq_quant, d_Wk_quant, d_Wv_quant,
                               d_Wq_scales, d_Wk_scales, d_Wv_scales,
                               d_Wq_zeros, d_Wk_zeros, d_Wv_zeros,
                               d_bq, d_bk, d_bv,
                               d_output, batch, seq_len, d_model, d_k, d_v,
-                              block_size, false);
+                              block_size, true);
 
     // Stop timing
     CUDA_CHECK(cudaEventRecord(stop));
@@ -401,26 +401,26 @@ int main() {
     printf("\n3. Flash-style Attention (Quantized)\n");
     // Dummy run to warm up GPU
     printf("Running dummy run for warm-up...\n");
-    flash_attention_quantized(d_X, 
+    flash_attention_quantized_blockwise(d_X, 
                               d_Wq_quant, d_Wk_quant, d_Wv_quant,
                               d_Wq_scales, d_Wk_scales, d_Wv_scales,
                               d_Wq_zeros, d_Wk_zeros, d_Wv_zeros,
                               d_bq, d_bk, d_bv,
                               d_output, batch, seq_len, d_model, d_k, d_v,
-                              block_size, false);
+                              block_size, true);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Start timing
     CUDA_CHECK(cudaEventRecord(start));
 
     // Run quantized attention
-    flash_attention_quantized(d_X, 
+    flash_attention_quantized_blockwise(d_X, 
                               d_Wq_quant, d_Wk_quant, d_Wv_quant,
                               d_Wq_scales, d_Wk_scales, d_Wv_scales,
                               d_Wq_zeros, d_Wk_zeros, d_Wv_zeros,
                               d_bq, d_bk, d_bv,
                               d_output, batch, seq_len, d_model, d_k, d_v,
-                              block_size, false);
+                              block_size, true);
 
     // Stop timing
     CUDA_CHECK(cudaEventRecord(stop));
@@ -442,26 +442,26 @@ int main() {
     printf("\n4. Our Attention (Quantized)\n");
     // Dummy run to warm up GPU
     printf("Running dummy run for warm-up...\n");
-    our_attention_quantized(d_X, 
+    our_attention_quantized_blockwise(d_X, 
                               d_Wq_quant, d_Wk_quant, d_Wv_quant,
                               d_Wq_scales, d_Wk_scales, d_Wv_scales,
                               d_Wq_zeros, d_Wk_zeros, d_Wv_zeros,
                               d_bq, d_bk, d_bv,
                               d_output, batch, seq_len, d_model, d_k, d_v,
-                              block_size, false);
+                              block_size, true);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Start timing
     CUDA_CHECK(cudaEventRecord(start));
 
     // Run quantized attention
-    our_attention_quantized(d_X, 
+    our_attention_quantized_blockwise(d_X, 
                               d_Wq_quant, d_Wk_quant, d_Wv_quant,
                               d_Wq_scales, d_Wk_scales, d_Wv_scales,
                               d_Wq_zeros, d_Wk_zeros, d_Wv_zeros,
                               d_bq, d_bk, d_bv,
                               d_output, batch, seq_len, d_model, d_k, d_v,
-                              block_size, false);
+                              block_size, true);
 
     // Stop timing
     CUDA_CHECK(cudaEventRecord(stop));
