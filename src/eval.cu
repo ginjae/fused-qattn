@@ -165,10 +165,11 @@ int main() {
     CUDA_CHECK(cudaMemcpy(d_bk, h_bk, bk_size, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_bv, h_bv, bv_size, cudaMemcpyHostToDevice));
 
-    // Allocate output buffers for both tests
-    float* h_output_naive_baseline = (float*)malloc(out_size);  // Baseline for comparison
-    float* h_output_unquant = (float*)malloc(out_size);
-    float* h_output_quant = (float*)malloc(out_size);
+    // Allocate output buffers for evaluation
+    float* h_baseline_unquantized = (float*)malloc(out_size);   // Naive unquantized baseline (top-level reference)
+    float* h_naive_baseline_int8 = (float*)malloc(out_size);    // Naive INT8 baseline (for INT8 section)
+    float* h_naive_baseline_mxfp4 = (float*)malloc(out_size);   // Naive MXFP4 baseline (for MXFP4 section)
+    float* h_result_temp = (float*)malloc(out_size);            // Temporary buffer for current test result
 
     // Create CUDA events for timing
     cudaEvent_t start, stop;
@@ -200,10 +201,10 @@ int main() {
     elapsed_time_unquant = compute_median(iteration_times, NUM_ITERATIONS);
 
     // Copy result back as baseline
-    CUDA_CHECK(cudaMemcpy(h_output_naive_baseline, d_output, out_size, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_baseline_unquantized, d_output, out_size, cudaMemcpyDeviceToHost));
 
     // Print results (first 3 and last 3 positions only)
-    // print_output_sample("Output (Unquantized)", h_output_naive_baseline, seq_len, d_v);
+    // print_output_sample("Output (Unquantized)", h_baseline_unquantized, seq_len, d_v);
     printf("Median execution time: %.4f ms\n", elapsed_time_unquant);
 
 
@@ -230,14 +231,14 @@ int main() {
     elapsed_time_unquant = compute_median(iteration_times, NUM_ITERATIONS);
 
     // Copy result back
-    CUDA_CHECK(cudaMemcpy(h_output_unquant, d_output, out_size, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
 
     // Print results (first 3 and last 3 positions only)
-    // print_output_sample("Output (Unquantized)", h_output_unquant, seq_len, d_v);
+    // print_output_sample("Output (Unquantized)", h_result_temp, seq_len, d_v);
     printf("Median execution time: %.4f ms\n", elapsed_time_unquant);
     
     // Compare with baseline
-    compute_error_metrics("Tiled vs Naive", h_output_naive_baseline, h_output_unquant, 
+    compute_error_metrics("Tiled vs Naive", h_baseline_unquantized, h_result_temp, 
                          batch, seq_len, d_v);
 
 
@@ -264,14 +265,14 @@ int main() {
     elapsed_time_unquant = compute_median(iteration_times, NUM_ITERATIONS);
 
     // Copy result back
-    CUDA_CHECK(cudaMemcpy(h_output_unquant, d_output, out_size, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
 
     // Print results (first 3 and last 3 positions only)
-    // print_output_sample("Output (Unquantized)", h_output_unquant, seq_len, d_v);
+    // print_output_sample("Output (Unquantized)", h_result_temp, seq_len, d_v);
     printf("Median execution time: %.4f ms\n", elapsed_time_unquant);
     
     // Compare with baseline
-    compute_error_metrics("Flash vs Naive", h_output_naive_baseline, h_output_unquant, 
+    compute_error_metrics("Flash vs Naive", h_baseline_unquantized, h_result_temp, 
                          batch, seq_len, d_v);
     
     printf("=== End of Test ===\n");
@@ -367,18 +368,18 @@ int main() {
     elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
 
     // Copy quantized result back
-    CUDA_CHECK(cudaMemcpy(h_output_quant, d_output, out_size, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
 
     // Print quantized results (first 3 and last 3 positions only)
-    // print_output_sample("Output (Quantized)", h_output_quant, seq_len, d_v);
+    // print_output_sample("Output (Quantized)", h_result_temp, seq_len, d_v);
     printf("Median execution time: %.4f ms\n", elapsed_time_quant);
     
     // Compare with baseline
-    compute_error_metrics("Naive Quantized vs Naive Baseline", h_output_naive_baseline, h_output_quant, 
+    compute_error_metrics("Naive Quantized vs Naive Baseline", h_baseline_unquantized, h_result_temp, 
                          batch, seq_len, d_v);
 
-    // Copy result back as baseline
-    CUDA_CHECK(cudaMemcpy(h_output_naive_baseline, d_output, out_size, cudaMemcpyDeviceToHost));
+    // Copy result back as INT8 baseline
+    CUDA_CHECK(cudaMemcpy(h_naive_baseline_int8, d_output, out_size, cudaMemcpyDeviceToHost));
 
     cooldown_gpu(COOLDOWN_SECONDS);
     printf("\n2. Tiled Attention (Quantized)\n");
@@ -411,14 +412,14 @@ int main() {
     elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
 
     // Copy quantized result back
-    CUDA_CHECK(cudaMemcpy(h_output_quant, d_output, out_size, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
 
     // Print quantized results (first 3 and last 3 positions only)
-    // print_output_sample("Output (Quantized)", h_output_quant, seq_len, d_v);
+    // print_output_sample("Output (Quantized)", h_result_temp, seq_len, d_v);
     printf("Median execution time: %.4f ms\n", elapsed_time_quant);
     
     // Compare with baseline
-    compute_error_metrics("Tiled Quantized vs Naive Quantized", h_output_naive_baseline, h_output_quant, 
+    compute_error_metrics("Tiled Quantized vs Naive Quantized", h_naive_baseline_int8, h_result_temp, 
                          batch, seq_len, d_v);
 
 
@@ -453,14 +454,14 @@ int main() {
     elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
 
     // Copy quantized result back
-    CUDA_CHECK(cudaMemcpy(h_output_quant, d_output, out_size, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
 
     // Print quantized results (first 3 and last 3 positions only)
-    // print_output_sample("Output (Quantized)", h_output_quant, seq_len, d_v);
+    // print_output_sample("Output (Quantized)", h_result_temp, seq_len, d_v);
     printf("Median execution time: %.4f ms\n", elapsed_time_quant);
     
     // Compare with baseline
-    compute_error_metrics("Flash Quantized vs Naive Quantized", h_output_naive_baseline, h_output_quant, 
+    compute_error_metrics("Flash Quantized vs Naive Quantized", h_naive_baseline_int8, h_result_temp, 
                          batch, seq_len, d_v);
 
 
@@ -495,14 +496,14 @@ int main() {
     elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
 
     // Copy quantized result back
-    CUDA_CHECK(cudaMemcpy(h_output_quant, d_output, out_size, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
 
     // Print quantized results (first 3 and last 3 positions only)
-    // print_output_sample("Output (Quantized)", h_output_quant, seq_len, d_v);
+    // print_output_sample("Output (Quantized)", h_result_temp, seq_len, d_v);
     printf("Median execution time: %.4f ms\n", elapsed_time_quant);
     
     // Compare with baseline
-    compute_error_metrics("Our Quantized vs Naive Quantized", h_output_naive_baseline, h_output_quant, 
+    compute_error_metrics("Our Quantized vs Naive Quantized", h_naive_baseline_int8, h_result_temp, 
                          batch, seq_len, d_v);
 
 
@@ -566,16 +567,16 @@ int main() {
     elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
 
     // Copy MXFP4 result back
-    CUDA_CHECK(cudaMemcpy(h_output_quant, d_output, out_size, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
 
     printf("Median execution time: %.4f ms\n", elapsed_time_quant);
     
-    // Compare with baseline
-    compute_error_metrics("Naive MXFP4 vs Naive Quantized", h_output_naive_baseline, h_output_quant, 
+    // Compare with unquantized baseline
+    compute_error_metrics("Naive MXFP4 vs Naive Baseline", h_baseline_unquantized, h_result_temp, 
                          batch, seq_len, d_v);
 
-    // Copy result back as baseline
-    CUDA_CHECK(cudaMemcpy(h_output_naive_baseline, d_output, out_size, cudaMemcpyDeviceToHost));
+    // Copy result back as MXFP4 baseline
+    CUDA_CHECK(cudaMemcpy(h_naive_baseline_mxfp4, d_output, out_size, cudaMemcpyDeviceToHost));
 
 
     cooldown_gpu(COOLDOWN_SECONDS);
@@ -605,14 +606,83 @@ int main() {
     elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
 
     // Copy MXFP4 result back
-    CUDA_CHECK(cudaMemcpy(h_output_quant, d_output, out_size, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
 
     printf("Median execution time: %.4f ms\n", elapsed_time_quant);
     
     // Compare with baseline
-    compute_error_metrics("Tiled MXFP4 vs Naive Quantized", h_output_naive_baseline, h_output_quant, 
+    compute_error_metrics("Tiled MXFP4 vs Naive MXFP4", h_naive_baseline_mxfp4, h_result_temp, 
                          batch, seq_len, d_v);
 
+    cooldown_gpu(COOLDOWN_SECONDS);
+    printf("\n3. Flash-style Attention (MXFP4)\n");
+    // Dummy run to warm up GPU
+    printf("Running dummy run for warm-up...\n");
+    flash_attention_mxfp4(d_X, 
+                          d_Wq_mxfp4, d_Wk_mxfp4, d_Wv_mxfp4,
+                          d_bq, d_bk, d_bv,
+                          d_output, batch, seq_len, d_model, d_k, d_v,
+                          true);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Run multiple iterations
+    printf("Running %d iterations...\n", NUM_ITERATIONS);
+    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
+        CUDA_CHECK(cudaEventRecord(start));
+        flash_attention_mxfp4(d_X, 
+                              d_Wq_mxfp4, d_Wk_mxfp4, d_Wv_mxfp4,
+                              d_bq, d_bk, d_bv,
+                              d_output, batch, seq_len, d_model, d_k, d_v,
+                              true);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
+    }
+    elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
+
+    // Copy MXFP4 result back
+    CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
+
+    printf("Median execution time: %.4f ms\n", elapsed_time_quant);
+    
+    // Compare with baseline
+    compute_error_metrics("Flash MXFP4 vs Naive MXFP4", h_naive_baseline_mxfp4, h_result_temp, 
+                         batch, seq_len, d_v);
+
+    cooldown_gpu(COOLDOWN_SECONDS);
+    printf("\n4. Our Attention (MXFP4)\n");
+
+    printf("Running dummy run for warm-up...\n");
+    our_attention_mxfp4(d_X, 
+                          d_Wq_mxfp4, d_Wk_mxfp4, d_Wv_mxfp4,
+                          d_bq, d_bk, d_bv,
+                          d_output, batch, seq_len, d_model, d_k, d_v,
+                          true);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Run multiple iterations
+    printf("Running %d iterations...\n", NUM_ITERATIONS);
+    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
+        CUDA_CHECK(cudaEventRecord(start));
+        our_attention_mxfp4(d_X, 
+                              d_Wq_mxfp4, d_Wk_mxfp4, d_Wv_mxfp4,
+                              d_bq, d_bk, d_bv,
+                              d_output, batch, seq_len, d_model, d_k, d_v,
+                              true);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
+    }
+    elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
+
+    // Copy MXFP4 result back
+    CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
+
+    printf("Median execution time: %.4f ms\n", elapsed_time_quant);
+    
+    // Compare with baseline
+    compute_error_metrics("Our MXFP4 vs Naive MXFP4", h_naive_baseline_mxfp4, h_result_temp, 
+                         batch, seq_len, d_v);
 
     // Cleanup CUDA events
     CUDA_CHECK(cudaEventDestroy(start));
@@ -628,9 +698,10 @@ int main() {
     free(h_bk);
     free(h_bv);
     free(h_output);
-    free(h_output_naive_baseline);
-    free(h_output_unquant);
-    free(h_output_quant);
+    free(h_baseline_unquantized);
+    free(h_naive_baseline_int8);
+    free(h_naive_baseline_mxfp4);
+    free(h_result_temp);
     free(h_Wq_quant);
     free(h_Wk_quant);
     free(h_Wv_quant);
