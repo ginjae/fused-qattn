@@ -45,4 +45,21 @@ void naive_attention_quantized_blockwise(
     bool verbose
 );
 
+void naive_attention_mxfp4(
+    const float* X,
+    const void* Wq_mxfp4,
+    const void* Wk_mxfp4,
+    const void* Wv_mxfp4,
+    const float* bq,
+    const float* bk,
+    const float* bv,
+    float* output,
+    int batch,
+    int seq_len,
+    int d_model,
+    int d_k,
+    int d_v,
+    bool verbose
+);
+
 #endif // ATTN_NAIVE_CUH

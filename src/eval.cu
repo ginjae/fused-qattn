@@ -377,6 +377,8 @@ int main() {
     compute_error_metrics("Naive Quantized vs Naive Baseline", h_output_naive_baseline, h_output_quant, 
                          batch, seq_len, d_v);
 
+    // Copy result back as baseline
+    CUDA_CHECK(cudaMemcpy(h_output_naive_baseline, d_output, out_size, cudaMemcpyDeviceToHost));
 
     cooldown_gpu(COOLDOWN_SECONDS);
     printf("\n2. Tiled Attention (Quantized)\n");
@@ -416,7 +418,7 @@ int main() {
     printf("Median execution time: %.4f ms\n", elapsed_time_quant);
     
     // Compare with baseline
-    compute_error_metrics("Tiled Quantized vs Naive Baseline", h_output_naive_baseline, h_output_quant, 
+    compute_error_metrics("Tiled Quantized vs Naive Quantized", h_output_naive_baseline, h_output_quant, 
                          batch, seq_len, d_v);
 
 
@@ -458,7 +460,7 @@ int main() {
     printf("Median execution time: %.4f ms\n", elapsed_time_quant);
     
     // Compare with baseline
-    compute_error_metrics("Flash Quantized vs Naive Baseline", h_output_naive_baseline, h_output_quant, 
+    compute_error_metrics("Flash Quantized vs Naive Quantized", h_output_naive_baseline, h_output_quant, 
                          batch, seq_len, d_v);
 
 
@@ -500,7 +502,115 @@ int main() {
     printf("Median execution time: %.4f ms\n", elapsed_time_quant);
     
     // Compare with baseline
-    compute_error_metrics("Our Quantized vs Naive Baseline", h_output_naive_baseline, h_output_quant, 
+    compute_error_metrics("Our Quantized vs Naive Quantized", h_output_naive_baseline, h_output_quant, 
+                         batch, seq_len, d_v);
+
+
+    printf("\n");
+    printf("\n=== Starting Evaluation (GPT-2 Scale, MXFP4 Quantized weights) ===\n");
+
+    // Quantize weights to MXFP4
+    printf("\n== Quantizing Weights to MXFP4 ==\n");
+    int num_blocks_q_mxfp4 = (d_model * d_k + MXFP4_BLOCK_SIZE - 1) / MXFP4_BLOCK_SIZE;
+    int num_blocks_v_mxfp4 = (d_model * d_v + MXFP4_BLOCK_SIZE - 1) / MXFP4_BLOCK_SIZE;
+
+    MXFP4Block* h_Wq_mxfp4 = (MXFP4Block*)malloc(num_blocks_q_mxfp4 * sizeof(MXFP4Block));
+    MXFP4Block* h_Wk_mxfp4 = (MXFP4Block*)malloc(num_blocks_q_mxfp4 * sizeof(MXFP4Block));
+    MXFP4Block* h_Wv_mxfp4 = (MXFP4Block*)malloc(num_blocks_v_mxfp4 * sizeof(MXFP4Block));
+
+    quantize_mxfp4(h_Wq, h_Wq_mxfp4, d_model * d_k);
+    quantize_mxfp4(h_Wk, h_Wk_mxfp4, d_model * d_k);
+    quantize_mxfp4(h_Wv, h_Wv_mxfp4, d_model * d_v);
+
+    printf("MXFP4 Block size: %d\n", MXFP4_BLOCK_SIZE);
+    printf("Num MXFP4 blocks (Q/K): %d, Num MXFP4 blocks (V): %d\n", num_blocks_q_mxfp4, num_blocks_v_mxfp4);
+    printf("MXFP4 Quantization complete.\n");
+
+    // Allocate device memory for MXFP4 quantized weights
+    MXFP4Block *d_Wq_mxfp4, *d_Wk_mxfp4, *d_Wv_mxfp4;
+
+    CUDA_CHECK(cudaMalloc(&d_Wq_mxfp4, num_blocks_q_mxfp4 * sizeof(MXFP4Block)));
+    CUDA_CHECK(cudaMalloc(&d_Wk_mxfp4, num_blocks_q_mxfp4 * sizeof(MXFP4Block)));
+    CUDA_CHECK(cudaMalloc(&d_Wv_mxfp4, num_blocks_v_mxfp4 * sizeof(MXFP4Block)));
+
+    // Copy MXFP4 quantized data to device
+    CUDA_CHECK(cudaMemcpy(d_Wq_mxfp4, h_Wq_mxfp4, num_blocks_q_mxfp4 * sizeof(MXFP4Block), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_Wk_mxfp4, h_Wk_mxfp4, num_blocks_q_mxfp4 * sizeof(MXFP4Block), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_Wv_mxfp4, h_Wv_mxfp4, num_blocks_v_mxfp4 * sizeof(MXFP4Block), cudaMemcpyHostToDevice));
+
+
+    cooldown_gpu(COOLDOWN_SECONDS);
+    printf("\n1. Naive Attention (MXFP4)\n");
+    // Dummy run to warm up GPU
+    printf("Running dummy run for warm-up...\n");
+    naive_attention_mxfp4(d_X, 
+                          d_Wq_mxfp4, d_Wk_mxfp4, d_Wv_mxfp4,
+                          d_bq, d_bk, d_bv,
+                          d_output, batch, seq_len, d_model, d_k, d_v,
+                          true);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Run multiple iterations
+    printf("Running %d iterations...\n", NUM_ITERATIONS);
+    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
+        CUDA_CHECK(cudaEventRecord(start));
+        naive_attention_mxfp4(d_X, 
+                              d_Wq_mxfp4, d_Wk_mxfp4, d_Wv_mxfp4,
+                              d_bq, d_bk, d_bv,
+                              d_output, batch, seq_len, d_model, d_k, d_v,
+                              true);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
+    }
+    elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
+
+    // Copy MXFP4 result back
+    CUDA_CHECK(cudaMemcpy(h_output_quant, d_output, out_size, cudaMemcpyDeviceToHost));
+
+    printf("Median execution time: %.4f ms\n", elapsed_time_quant);
+    
+    // Compare with baseline
+    compute_error_metrics("Naive MXFP4 vs Naive Quantized", h_output_naive_baseline, h_output_quant, 
+                         batch, seq_len, d_v);
+
+    // Copy result back as baseline
+    CUDA_CHECK(cudaMemcpy(h_output_naive_baseline, d_output, out_size, cudaMemcpyDeviceToHost));
+
+
+    cooldown_gpu(COOLDOWN_SECONDS);
+    printf("\n2. Tiled Attention (MXFP4)\n");
+    // Dummy run to warm up GPU
+    printf("Running dummy run for warm-up...\n");
+    tiled_attention_mxfp4(d_X, 
+                          d_Wq_mxfp4, d_Wk_mxfp4, d_Wv_mxfp4,
+                          d_bq, d_bk, d_bv,
+                          d_output, batch, seq_len, d_model, d_k, d_v,
+                          true);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Run multiple iterations
+    printf("Running %d iterations...\n", NUM_ITERATIONS);
+    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
+        CUDA_CHECK(cudaEventRecord(start));
+        tiled_attention_mxfp4(d_X, 
+                              d_Wq_mxfp4, d_Wk_mxfp4, d_Wv_mxfp4,
+                              d_bq, d_bk, d_bv,
+                              d_output, batch, seq_len, d_model, d_k, d_v,
+                              true);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
+    }
+    elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
+
+    // Copy MXFP4 result back
+    CUDA_CHECK(cudaMemcpy(h_output_quant, d_output, out_size, cudaMemcpyDeviceToHost));
+
+    printf("Median execution time: %.4f ms\n", elapsed_time_quant);
+    
+    // Compare with baseline
+    compute_error_metrics("Tiled MXFP4 vs Naive Quantized", h_output_naive_baseline, h_output_quant, 
                          batch, seq_len, d_v);
 
 
@@ -530,6 +640,9 @@ int main() {
     free(h_Wq_zeros);
     free(h_Wk_zeros);
     free(h_Wv_zeros);
+    free(h_Wq_mxfp4);
+    free(h_Wk_mxfp4);
+    free(h_Wv_mxfp4);
 
     CUDA_CHECK(cudaFree(d_X));
     CUDA_CHECK(cudaFree(d_Wq));
@@ -548,6 +661,9 @@ int main() {
     CUDA_CHECK(cudaFree(d_Wq_zeros));
     CUDA_CHECK(cudaFree(d_Wk_zeros));
     CUDA_CHECK(cudaFree(d_Wv_zeros));
+    CUDA_CHECK(cudaFree(d_Wq_mxfp4));
+    CUDA_CHECK(cudaFree(d_Wk_mxfp4));
+    CUDA_CHECK(cudaFree(d_Wv_mxfp4));
 
     printf("=== End of Test ===\n");
 
