@@ -1,0 +1,93 @@
+CUDA_VISIBLE_DEVICES=0 ./eval
+
+=== Starting Evaluation (GPT-2 Scale, Unquantized weights) ===
+
+== Initializing Weights ==
+Cooling down GPU for 3 seconds...
+
+1. Naive Attention (BASELINE)
+Running dummy run for warm-up...
+Running 100 iterations...
+Median execution time: 0.2243 ms
+Cooling down GPU for 3 seconds...
+
+2. Tiled Attention
+Running dummy run for warm-up...
+Running 100 iterations...
+Median execution time: 0.1372 ms
+  Tiled vs Naive Correctness Check:
+    Max Absolute Error: 8.940697e-08
+    Mean Absolute Error: 6.521097e-09
+    RMSE: 1.112638e-08
+    Relative Error: 1.172163e-07
+    Status: ✓ PASS (High precision match)
+Cooling down GPU for 3 seconds...
+
+3. Flash-style Attention
+Running dummy run for warm-up...
+Running 100 iterations...
+Median execution time: 0.1157 ms
+  Flash vs Naive Correctness Check:
+    Max Absolute Error: 7.450581e-08
+    Mean Absolute Error: 7.887488e-09
+    RMSE: 1.178768e-08
+    Relative Error: 1.241831e-07
+    Status: ✓ PASS (High precision match)
+=== End of Test ===
+
+
+=== Starting Evaluation (GPT-2 Scale, Quantized weights) ===
+
+== Quantizing Weights ==
+Block size: 64
+Num blocks (Q/K): 768, Num blocks (V): 768
+Quantization complete.
+Cooling down GPU for 3 seconds...
+
+1. Naive Attention (Quantized)
+Running dummy run for warm-up...
+Running 100 iterations...
+Median execution time: 0.2724 ms
+  Naive Quantized vs Naive Baseline Correctness Check:
+    Max Absolute Error: 5.554937e-03
+    Mean Absolute Error: 2.527337e-04
+    RMSE: 3.789534e-04
+    Relative Error: 3.992272e-03
+    Status: ✓ PASS (Acceptable precision)
+Cooling down GPU for 3 seconds...
+
+2. Tiled Attention (Quantized)
+Running dummy run for warm-up...
+Running 100 iterations...
+Median execution time: 0.1864 ms
+  Tiled Quantized vs Naive Baseline Correctness Check:
+    Max Absolute Error: 5.554937e-03
+    Mean Absolute Error: 2.527336e-04
+    RMSE: 3.789534e-04
+    Relative Error: 3.992272e-03
+    Status: ✓ PASS (Acceptable precision)
+Cooling down GPU for 3 seconds...
+
+3. Flash-style Attention (Quantized)
+Running dummy run for warm-up...
+Running 100 iterations...
+Median execution time: 0.1649 ms
+  Flash Quantized vs Naive Baseline Correctness Check:
+    Max Absolute Error: 5.554937e-03
+    Mean Absolute Error: 2.527337e-04
+    RMSE: 3.789535e-04
+    Relative Error: 3.992273e-03
+    Status: ✓ PASS (Acceptable precision)
+Cooling down GPU for 3 seconds...
+
+4. Our Attention (Quantized)
+Running dummy run for warm-up...
+Running 100 iterations...
+Median execution time: 0.1280 ms
+  Our Quantized vs Naive Baseline Correctness Check:
+    Max Absolute Error: 5.554937e-03
+    Mean Absolute Error: 2.527337e-04
+    RMSE: 3.789535e-04
+    Relative Error: 3.992273e-03
+    Status: ✓ PASS (Acceptable precision)
+=== End of Test ===
