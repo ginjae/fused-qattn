@@ -62,4 +62,21 @@ void our_attention_mxfp4(
     bool verbose
 );
 
+void our_attention_nf4(
+    const float* d_X,
+    const void* d_Wq_nf4,
+    const void* d_Wk_nf4,
+    const void* d_Wv_nf4,
+    const float* d_bq,
+    const float* d_bk,
+    const float* d_bv,
+    float* d_output,
+    int batch,
+    int seq_len,
+    int d_model,
+    int d_k,
+    int d_v,
+    bool causal_mask = false
+);
+
 #endif // ATTN_OURS_CUH

@@ -66,6 +66,127 @@ void dequantize_blockwise_cpu(
 }
 
 // ============================================================================
+// NF4 Quantization Implementation
+// ============================================================================
+
+// NF4 lookup table: 16 quantiles from a normal distribution N(0,1)
+// These values are optimal for quantizing weights from a normal distribution
+static const float NF4_QUANT_TABLE[16] = {
+    -1.0f,
+    -0.6961928009986877f,
+    -0.5250730514526367f,
+    -0.39491748809814453f,
+    -0.28444138169288635f,
+    -0.18477343022823334f,
+    -0.09105003625154495f,
+    0.0f,
+    0.07958029955625534f,
+    0.16093020141124725f,
+    0.24611230194568634f,
+    0.33791524171829224f,
+    0.44070982933044434f,
+    0.5626170039176941f,
+    0.7229568362236023f,
+    1.0f
+};
+
+// Helper function to convert float to NF4 (4 bits)
+// Maps input to closest quantile and returns index (0-15)
+inline uint8_t float_to_nf4(float value, float absmax) {
+    if (absmax < 1e-8f || value == 0.0f) return 7; // Map to zero
+    
+    // Normalize value to [-1, 1] range
+    float normalized = value / absmax;
+    normalized = fmaxf(-1.0f, fminf(1.0f, normalized));
+    
+    // Find closest quantile
+    float min_dist = fabsf(normalized - NF4_QUANT_TABLE[0]);
+    uint8_t best_idx = 0;
+    
+    for (int i = 1; i < 16; i++) {
+        float dist = fabsf(normalized - NF4_QUANT_TABLE[i]);
+        if (dist < min_dist) {
+            min_dist = dist;
+            best_idx = i;
+        }
+    }
+    
+    return best_idx;
+}
+
+// Helper function to convert NF4 back to float
+inline float nf4_to_float(uint8_t nf4_val, float absmax) {
+    if (nf4_val >= 16) nf4_val = 15; // Clamp to valid range
+    return NF4_QUANT_TABLE[nf4_val] * absmax;
+}
+
+// CPU function to quantize weights to NF4 format
+void quantize_nf4(
+    const float* weights,
+    NF4Block* quantized_blocks,
+    int total_size
+) {
+    int num_blocks = (total_size + NF4_BLOCK_SIZE - 1) / NF4_BLOCK_SIZE;
+    
+    for (int b = 0; b < num_blocks; b++) {
+        int start = b * NF4_BLOCK_SIZE;
+        int end = std::min(start + NF4_BLOCK_SIZE, total_size);
+        
+        // Find absolute maximum in this block
+        float absmax = 0.0f;
+        for (int i = start; i < end; i++) {
+            float abs_val = fabsf(weights[i]);
+            if (abs_val > absmax) absmax = abs_val;
+        }
+        
+        quantized_blocks[b].absmax = absmax;
+        
+        // Quantize each value in the block
+        for (int i = 0; i < NF4_BLOCK_SIZE; i++) {
+            int idx = start + i;
+            float value = (idx < total_size) ? weights[idx] : 0.0f;
+            
+            uint8_t nf4_val = float_to_nf4(value, absmax);
+            
+            // Pack 2 values per byte
+            if (i % 2 == 0) {
+                quantized_blocks[b].data[i / 2] = nf4_val << 4;
+            } else {
+                quantized_blocks[b].data[i / 2] |= nf4_val;
+            }
+        }
+    }
+}
+
+// CPU function to dequantize NF4 weights back to float
+void dequantize_nf4_cpu(
+    const NF4Block* quantized_blocks,
+    float* weights,
+    int total_size
+) {
+    int num_blocks = (total_size + NF4_BLOCK_SIZE - 1) / NF4_BLOCK_SIZE;
+    
+    for (int b = 0; b < num_blocks; b++) {
+        int start = b * NF4_BLOCK_SIZE;
+        int end = std::min(start + NF4_BLOCK_SIZE, total_size);
+        
+        float absmax = quantized_blocks[b].absmax;
+        
+        for (int i = 0; i < NF4_BLOCK_SIZE && (start + i) < total_size; i++) {
+            // Unpack 4-bit value
+            uint8_t nf4_val;
+            if (i % 2 == 0) {
+                nf4_val = (quantized_blocks[b].data[i / 2] >> 4) & 0xF;
+            } else {
+                nf4_val = quantized_blocks[b].data[i / 2] & 0xF;
+            }
+            
+            weights[start + i] = nf4_to_float(nf4_val, absmax);
+        }
+    }
+}
+
+// ============================================================================
 // MXFP4 Quantization Implementation
 // ============================================================================
 
@@ -311,6 +432,61 @@ __global__ void dequantize_blockwise_kernel(
         int8_t quantized_val = W_quantized[idx];
 
         W_dequantized[idx] = scale * (float)(quantized_val - zero_point);
+    }
+}
+
+// ============================================================================
+// NF4 GPU Kernels
+// ============================================================================
+
+// GPU constant memory for NF4 lookup table
+__constant__ float NF4_QUANT_TABLE_GPU[16] = {
+    -1.0f,
+    -0.6961928009986877f,
+    -0.5250730514526367f,
+    -0.39491748809814453f,
+    -0.28444138169288635f,
+    -0.18477343022823334f,
+    -0.09105003625154495f,
+    0.0f,
+    0.07958029955625534f,
+    0.16093020141124725f,
+    0.24611230194568634f,
+    0.33791524171829224f,
+    0.44070982933044434f,
+    0.5626170039176941f,
+    0.7229568362236023f,
+    1.0f
+};
+
+// GPU Kernel for NF4 Dequantization
+// Dequantizes NF4 weights to float
+// W_quantized: [num_blocks] NF4 blocks
+// W_dequantized: [total_size] output float values
+__global__ void dequantize_nf4_kernel(
+    const NF4Block* W_quantized,
+    float* W_dequantized,
+    int total_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx < total_size) {
+        int block_idx = idx / NF4_BLOCK_SIZE;
+        int local_idx = idx % NF4_BLOCK_SIZE;
+        
+        float absmax = W_quantized[block_idx].absmax;
+        
+        // Unpack 4-bit value
+        uint8_t nf4_val;
+        if (local_idx % 2 == 0) {
+            nf4_val = (W_quantized[block_idx].data[local_idx / 2] >> 4) & 0xF;
+        } else {
+            nf4_val = W_quantized[block_idx].data[local_idx / 2] & 0xF;
+        }
+        
+        // Dequantize using lookup table
+        if (nf4_val >= 16) nf4_val = 15;
+        W_dequantized[idx] = NF4_QUANT_TABLE_GPU[nf4_val] * absmax;
     }
 }
 
@@ -649,6 +825,161 @@ __global__ void fused_dequant_qkv_projection_kernel(
             const float scale_v = __ldg(&Wv_scales[block_idx_v]);
             const int8_t zero_v = __ldg(&Wv_zeros[block_idx_v]);
             Wv_tile[threadIdx.y][threadIdx.x] = scale_v * (float)(v_val - zero_v);
+        } else {
+            Wv_tile[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        // 3. Single sync after all loads
+        __syncthreads();
+
+        // 4. Compute all three matmuls together
+        for (int k = 0; k < TILE_SIZE; k++) {
+            float x_val = X_tile[threadIdx.y][k];
+            sum_q = __fmaf_rn(x_val, Wq_tile[k][threadIdx.x], sum_q);
+            sum_k = __fmaf_rn(x_val, Wk_tile[k][threadIdx.x], sum_k);
+            sum_v = __fmaf_rn(x_val, Wv_tile[k][threadIdx.x], sum_v);
+        }
+        __syncthreads();
+    }
+
+    // Write Q result with bias (coalesced writes)
+    if (b_idx < batch && row < seq_len && col < d_k) {
+        if (bq != nullptr) {
+            sum_q = __fmaf_rn(1.0f, __ldg(&bq[col]), sum_q);
+        }
+        Q[b_idx * seq_len * d_k + row * d_k + col] = sum_q;
+    }
+
+    // Write K result with bias
+    if (b_idx < batch && row < seq_len && col < d_k) {
+        if (bk != nullptr) {
+            sum_k = __fmaf_rn(1.0f, __ldg(&bk[col]), sum_k);
+        }
+        K[b_idx * seq_len * d_k + row * d_k + col] = sum_k;
+    }
+
+    // Write V result with bias
+    if (b_idx < batch && row < seq_len && col < d_v) {
+        if (bv != nullptr) {
+            sum_v = __fmaf_rn(1.0f, __ldg(&bv[col]), sum_v);
+        }
+        V[b_idx * seq_len * d_v + row * d_v + col] = sum_v;
+    }
+}
+
+// ============================================================================
+// Fused NF4 Dequantization + QKV Projection Kernel
+// ============================================================================
+
+// Kernel: Fused NF4 Dequantization + QKV Projection
+// Performs on-the-fly NF4 dequantization during matrix multiplication
+// X: [batch, seq_len, d_model]
+// Wq_quantized, Wk_quantized, Wv_quantized: NF4Block arrays
+// Q, K, V: [batch, seq_len, d_k/d_v]
+__global__ void fused_nf4_qkv_projection_kernel(
+    const float* __restrict__ X,
+    const NF4Block* __restrict__ Wq_quantized,
+    const NF4Block* __restrict__ Wk_quantized,
+    const NF4Block* __restrict__ Wv_quantized,
+    const float* __restrict__ bq,
+    const float* __restrict__ bk,
+    const float* __restrict__ bv,
+    float* __restrict__ Q,
+    float* __restrict__ K,
+    float* __restrict__ V,
+    int batch,
+    int seq_len,
+    int d_model,
+    int d_k,
+    int d_v
+) {
+    // Padded shared memory to avoid bank conflicts
+    __shared__ float X_tile[TILE_SIZE][TILE_SIZE + 1];
+    __shared__ float Wq_tile[TILE_SIZE][TILE_SIZE + 1];
+    __shared__ float Wk_tile[TILE_SIZE][TILE_SIZE + 1];
+    __shared__ float Wv_tile[TILE_SIZE][TILE_SIZE + 1];
+
+    const int b_idx = blockIdx.z;
+    const int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    const int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+
+    float sum_q = 0.0f;
+    float sum_k = 0.0f;
+    float sum_v = 0.0f;
+
+    // Pre-compute base index for X access
+    const int x_base = b_idx * seq_len * d_model + row * d_model;
+
+    for (int t = 0; t < (d_model + TILE_SIZE - 1) / TILE_SIZE; t++) {
+        // 1. Load X tile once (shared for all three projections)
+        const int x_col = t * TILE_SIZE + threadIdx.x;
+        if (b_idx < batch && row < seq_len && x_col < d_model) {
+            X_tile[threadIdx.y][threadIdx.x] = __ldg(&X[x_base + x_col]);
+        } else {
+            X_tile[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        const int w_row = t * TILE_SIZE + threadIdx.y;
+        const int w_col = col;
+
+        // 2. Load and dequantize ALL weight tiles in parallel
+        // Dequantize Wq from NF4
+        if (w_row < d_model && w_col < d_k) {
+            const int wq_idx = w_row * d_k + w_col;
+            const int block_idx = wq_idx / NF4_BLOCK_SIZE;
+            const int local_idx = wq_idx % NF4_BLOCK_SIZE;
+            
+            const float absmax = Wq_quantized[block_idx].absmax;
+            
+            // Unpack 4-bit value
+            uint8_t nf4_val;
+            if (local_idx % 2 == 0) {
+                nf4_val = (Wq_quantized[block_idx].data[local_idx / 2] >> 4) & 0xF;
+            } else {
+                nf4_val = Wq_quantized[block_idx].data[local_idx / 2] & 0xF;
+            }
+            
+            if (nf4_val >= 16) nf4_val = 15;
+            Wq_tile[threadIdx.y][threadIdx.x] = NF4_QUANT_TABLE_GPU[nf4_val] * absmax;
+
+            // Dequantize Wk from NF4
+            const int wk_idx = w_row * d_k + w_col;
+            const int block_idx_k = wk_idx / NF4_BLOCK_SIZE;
+            const int local_idx_k = wk_idx % NF4_BLOCK_SIZE;
+            
+            const float absmax_k = Wk_quantized[block_idx_k].absmax;
+            
+            uint8_t nf4_val_k;
+            if (local_idx_k % 2 == 0) {
+                nf4_val_k = (Wk_quantized[block_idx_k].data[local_idx_k / 2] >> 4) & 0xF;
+            } else {
+                nf4_val_k = Wk_quantized[block_idx_k].data[local_idx_k / 2] & 0xF;
+            }
+            
+            if (nf4_val_k >= 16) nf4_val_k = 15;
+            Wk_tile[threadIdx.y][threadIdx.x] = NF4_QUANT_TABLE_GPU[nf4_val_k] * absmax_k;
+        } else {
+            Wq_tile[threadIdx.y][threadIdx.x] = 0.0f;
+            Wk_tile[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        // Dequantize Wv from NF4
+        if (w_row < d_model && w_col < d_v) {
+            const int wv_idx = w_row * d_v + w_col;
+            const int block_idx_v = wv_idx / NF4_BLOCK_SIZE;
+            const int local_idx_v = wv_idx % NF4_BLOCK_SIZE;
+            
+            const float absmax_v = Wv_quantized[block_idx_v].absmax;
+            
+            uint8_t nf4_val_v;
+            if (local_idx_v % 2 == 0) {
+                nf4_val_v = (Wv_quantized[block_idx_v].data[local_idx_v / 2] >> 4) & 0xF;
+            } else {
+                nf4_val_v = Wv_quantized[block_idx_v].data[local_idx_v / 2] & 0xF;
+            }
+            
+            if (nf4_val_v >= 16) nf4_val_v = 15;
+            Wv_tile[threadIdx.y][threadIdx.x] = NF4_QUANT_TABLE_GPU[nf4_val_v] * absmax_v;
         } else {
             Wv_tile[threadIdx.y][threadIdx.x] = 0.0f;
         }

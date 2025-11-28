@@ -11,7 +11,7 @@
 #include "attn_ours.cuh"
 
 #define NUM_ITERATIONS 100
-#define COOLDOWN_SECONDS 3  // seconds to wait between tests
+#define COOLDOWN_SECONDS 1  // seconds to wait between tests
 
 
 void print_output_sample(const char* label, float* output, int seq_len, int d_v) {
@@ -169,6 +169,7 @@ int main() {
     float* h_baseline_unquantized = (float*)malloc(out_size);   // Naive unquantized baseline (top-level reference)
     float* h_naive_baseline_int8 = (float*)malloc(out_size);    // Naive INT8 baseline (for INT8 section)
     float* h_naive_baseline_mxfp4 = (float*)malloc(out_size);   // Naive MXFP4 baseline (for MXFP4 section)
+    float* h_naive_baseline_nf4 = (float*)malloc(out_size);     // Naive NF4 baseline (for NF4 section)
     float* h_result_temp = (float*)malloc(out_size);            // Temporary buffer for current test result
 
     // Create CUDA events for timing
@@ -683,6 +684,185 @@ int main() {
     // Compare with baseline
     compute_error_metrics("Our MXFP4 vs Naive MXFP4", h_naive_baseline_mxfp4, h_result_temp, 
                          batch, seq_len, d_v);
+
+
+    printf("\n");
+    printf("\n=== Starting Evaluation (GPT-2 Scale, NF4 Quantized weights) ===\n");
+
+    // Quantize weights to NF4
+    printf("\n== Quantizing Weights to NF4 ==\n");
+    int num_blocks_q_nf4 = (d_model * d_k + NF4_BLOCK_SIZE - 1) / NF4_BLOCK_SIZE;
+    int num_blocks_v_nf4 = (d_model * d_v + NF4_BLOCK_SIZE - 1) / NF4_BLOCK_SIZE;
+
+    NF4Block* h_Wq_nf4 = (NF4Block*)malloc(num_blocks_q_nf4 * sizeof(NF4Block));
+    NF4Block* h_Wk_nf4 = (NF4Block*)malloc(num_blocks_q_nf4 * sizeof(NF4Block));
+    NF4Block* h_Wv_nf4 = (NF4Block*)malloc(num_blocks_v_nf4 * sizeof(NF4Block));
+
+    quantize_nf4(h_Wq, h_Wq_nf4, d_model * d_k);
+    quantize_nf4(h_Wk, h_Wk_nf4, d_model * d_k);
+    quantize_nf4(h_Wv, h_Wv_nf4, d_model * d_v);
+
+    printf("NF4 Block size: %d\n", NF4_BLOCK_SIZE);
+    printf("Num NF4 blocks (Q/K): %d, Num NF4 blocks (V): %d\n", num_blocks_q_nf4, num_blocks_v_nf4);
+    printf("NF4 Quantization complete.\n");
+
+    // Allocate device memory for NF4 quantized weights
+    NF4Block *d_Wq_nf4, *d_Wk_nf4, *d_Wv_nf4;
+
+    CUDA_CHECK(cudaMalloc(&d_Wq_nf4, num_blocks_q_nf4 * sizeof(NF4Block)));
+    CUDA_CHECK(cudaMalloc(&d_Wk_nf4, num_blocks_q_nf4 * sizeof(NF4Block)));
+    CUDA_CHECK(cudaMalloc(&d_Wv_nf4, num_blocks_v_nf4 * sizeof(NF4Block)));
+
+    // Copy NF4 quantized data to device
+    CUDA_CHECK(cudaMemcpy(d_Wq_nf4, h_Wq_nf4, num_blocks_q_nf4 * sizeof(NF4Block), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_Wk_nf4, h_Wk_nf4, num_blocks_q_nf4 * sizeof(NF4Block), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_Wv_nf4, h_Wv_nf4, num_blocks_v_nf4 * sizeof(NF4Block), cudaMemcpyHostToDevice));
+
+
+    cooldown_gpu(COOLDOWN_SECONDS);
+    printf("\n1. Naive Attention (NF4)\n");
+    // Dummy run to warm up GPU
+    printf("Running dummy run for warm-up...\n");
+    naive_attention_nf4(d_X,
+                        d_Wq_nf4, d_Wk_nf4, d_Wv_nf4,
+                        d_bq, d_bk, d_bv,
+                        d_output, batch, seq_len, d_model, d_k, d_v,
+                        true);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Run multiple iterations
+    printf("Running %d iterations...\n", NUM_ITERATIONS);
+    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
+        CUDA_CHECK(cudaEventRecord(start));
+        naive_attention_nf4(d_X, 
+                            d_Wq_nf4, d_Wk_nf4, d_Wv_nf4,
+                            d_bq, d_bk, d_bv,
+                            d_output, batch, seq_len, d_model, d_k, d_v,
+                            true);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
+    }
+    elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
+
+    // Copy NF4 result back
+    CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
+
+    printf("Median execution time: %.4f ms\n", elapsed_time_quant);
+    
+    // Compare with unquantized baseline
+    compute_error_metrics("Naive NF4 vs Naive Baseline", h_baseline_unquantized, h_result_temp, 
+                         batch, seq_len, d_v);
+
+    // Copy result back as NF4 baseline
+    CUDA_CHECK(cudaMemcpy(h_naive_baseline_nf4, d_output, out_size, cudaMemcpyDeviceToHost));
+
+
+    cooldown_gpu(COOLDOWN_SECONDS);
+    printf("\n2. Tiled Attention (NF4)\n");
+    // Dummy run to warm up GPU
+    printf("Running dummy run for warm-up...\n");
+    tiled_attention_nf4(d_X, 
+                        d_Wq_nf4, d_Wk_nf4, d_Wv_nf4,
+                        d_bq, d_bk, d_bv,
+                        d_output, batch, seq_len, d_model, d_k, d_v,
+                        true);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Run multiple iterations
+    printf("Running %d iterations...\n", NUM_ITERATIONS);
+    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
+        CUDA_CHECK(cudaEventRecord(start));
+        tiled_attention_nf4(d_X, 
+                            d_Wq_nf4, d_Wk_nf4, d_Wv_nf4,
+                            d_bq, d_bk, d_bv,
+                            d_output, batch, seq_len, d_model, d_k, d_v,
+                            true);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
+    }
+    elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
+
+    // Copy NF4 result back
+    CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
+
+    printf("Median execution time: %.4f ms\n", elapsed_time_quant);
+    
+    // Compare with baseline
+    compute_error_metrics("Tiled NF4 vs Naive NF4", h_naive_baseline_nf4, h_result_temp, 
+                         batch, seq_len, d_v);
+
+    cooldown_gpu(COOLDOWN_SECONDS);
+    printf("\n3. Flash-style Attention (NF4)\n");
+    // Dummy run to warm up GPU
+    printf("Running dummy run for warm-up...\n");
+    flash_attention_nf4(d_X, 
+                        d_Wq_nf4, d_Wk_nf4, d_Wv_nf4,
+                        d_bq, d_bk, d_bv,
+                        d_output, batch, seq_len, d_model, d_k, d_v,
+                        true);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Run multiple iterations
+    printf("Running %d iterations...\n", NUM_ITERATIONS);
+    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
+        CUDA_CHECK(cudaEventRecord(start));
+        flash_attention_nf4(d_X, 
+                            d_Wq_nf4, d_Wk_nf4, d_Wv_nf4,
+                            d_bq, d_bk, d_bv,
+                            d_output, batch, seq_len, d_model, d_k, d_v,
+                            true);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
+    }
+    elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
+
+    // Copy NF4 result back
+    CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
+
+    printf("Median execution time: %.4f ms\n", elapsed_time_quant);
+    
+    // Compare with baseline
+    compute_error_metrics("Flash NF4 vs Naive NF4", h_naive_baseline_nf4, h_result_temp, 
+                         batch, seq_len, d_v);
+
+    cooldown_gpu(COOLDOWN_SECONDS);
+    printf("\n4. Our Attention (NF4)\n");
+
+    printf("Running dummy run for warm-up...\n");
+    our_attention_nf4(d_X, 
+                          d_Wq_nf4, d_Wk_nf4, d_Wv_nf4,
+                          d_bq, d_bk, d_bv,
+                          d_output, batch, seq_len, d_model, d_k, d_v,
+                          true);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Run multiple iterations
+    printf("Running %d iterations...\n", NUM_ITERATIONS);
+    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
+        CUDA_CHECK(cudaEventRecord(start));
+        our_attention_nf4(d_X, 
+                          d_Wq_nf4, d_Wk_nf4, d_Wv_nf4,
+                          d_bq, d_bk, d_bv,
+                          d_output, batch, seq_len, d_model, d_k, d_v,
+                          true);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
+    }
+    elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
+
+    // Copy MXFP4 result back
+    CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
+
+    printf("Median execution time: %.4f ms\n", elapsed_time_quant);
+    
+    // Compare with baseline
+    compute_error_metrics("Our NF4 vs Naive NF4", h_naive_baseline_nf4, h_result_temp, 
+                         batch, seq_len, d_v);
+
 
     // Cleanup CUDA events
     CUDA_CHECK(cudaEventDestroy(start));
