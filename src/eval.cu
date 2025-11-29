@@ -1070,10 +1070,10 @@ int main() {
     printf("========================================================================\n");
     printf("%-20s | %-12s | %-12s | %-12s\n", "Implementation", "No Quant (ms)", "MXFP4 (ms)", "NF4 (ms)");
     printf("------------------------------------------------------------------------\n");
-    printf("%-20s | %12.4f | %12.4f | %12.4f\n", "Naive", time_unquant_naive, time_mxfp4_naive, time_nf4_naive);
-    printf("%-20s | %12.4f | %12.4f | %12.4f\n", "Tiled", time_unquant_tiled, time_mxfp4_tiled, time_nf4_tiled);
-    printf("%-20s | %12.4f | %12.4f | %12.4f\n", "Flash", time_unquant_flash, time_mxfp4_flash, time_nf4_flash);
-    printf("%-20s | %12s | %12.4f | %12.4f\n", "Ours", "N/A", time_mxfp4_ours, time_nf4_ours);
+    printf("%-20s | %13.4f | %12.4f | %12.4f\n", "Naive", time_unquant_naive, time_mxfp4_naive, time_nf4_naive);
+    printf("%-20s | %13.4f | %12.4f | %12.4f\n", "Tiled", time_unquant_tiled, time_mxfp4_tiled, time_nf4_tiled);
+    printf("%-20s | %13.4f | %12.4f | %12.4f\n", "Flash", time_unquant_flash, time_mxfp4_flash, time_nf4_flash);
+    printf("%-20s | %13s | %12.4f | %12.4f\n", "Ours", "N/A", time_mxfp4_ours, time_nf4_ours);
     printf("========================================================================\n");
     
     // Calculate and display speedups
@@ -1081,17 +1081,17 @@ int main() {
     printf("========================================================================\n");
     printf("                    SPEEDUP vs Naive (Same Quant)                      \n");
     printf("========================================================================\n");
-    printf("%-20s | %-12s | %-12s | %-12s\n", "Implementation", "No Quant", "MXFP4", "NF4");
+    printf("%-20s | %-13s | %-12s | %-12s\n", "Implementation", "No Quant", "MXFP4", "NF4");
     printf("------------------------------------------------------------------------\n");
-    printf("%-20s | %11.2fx | %11.2fx | %11.2fx\n", "Tiled", 
+    printf("%-20s | %12.2fx | %11.2fx | %11.2fx\n", "Tiled", 
            time_unquant_naive/time_unquant_tiled, 
            time_mxfp4_naive/time_mxfp4_tiled, 
            time_nf4_naive/time_nf4_tiled);
-    printf("%-20s | %11.2fx | %11.2fx | %11.2fx\n", "Flash", 
+    printf("%-20s | %12.2fx | %11.2fx | %11.2fx\n", "Flash", 
            time_unquant_naive/time_unquant_flash, 
            time_mxfp4_naive/time_mxfp4_flash, 
            time_nf4_naive/time_nf4_flash);
-    printf("%-20s | %12s | %11.2fx | %11.2fx\n", "Ours", 
+    printf("%-20s | %13s | %11.2fx | %11.2fx\n", "Ours", 
            "N/A", 
            time_mxfp4_naive/time_mxfp4_ours, 
            time_nf4_naive/time_nf4_ours);
