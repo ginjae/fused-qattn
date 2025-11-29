@@ -17,6 +17,7 @@
 
 #define TILE_SIZE 16    // Tile size for fused_dequant_qkv_projection_kernel
 #define MXFP4_BLOCK_SIZE 32  // Block size for MXFP4 quantization
+#define NVFP4_BLOCK_SIZE 16  // Block size for NVFP4 quantization
 #define NF4_BLOCK_SIZE 64    // Block size for NF4 quantization
 
 // MXFP4 quantized data structure
@@ -24,6 +25,14 @@
 struct MXFP4Block {
     uint8_t shared_exp;     // Shared exponent for the block
     uint8_t data[16];       // Packed 4-bit values (2 values per byte, for 32 values)
+};
+
+// NVFP4 quantized data structure (NVIDIA Blackwell format)
+// Each block has one E4M3 FP8 scale and contains NVFP4_BLOCK_SIZE 4-bit mantissas
+// Uses finer-grained 16-value blocks for better accuracy
+struct NVFP4Block {
+    uint8_t scale_e4m3;     // FP8 E4M3 scale factor for the block
+    uint8_t data[8];        // Packed 4-bit values (2 values per byte, for 16 values)
 };
 
 // NF4 quantized data structure
@@ -69,6 +78,21 @@ void dequantize_mxfp4_cpu(
     int total_size
 );
 
+// NVFP4 Quantization Functions
+// Quantize weights to NVFP4 format (CPU version)
+void quantize_nvfp4(
+    const float* weights,
+    NVFP4Block* quantized_blocks,
+    int total_size
+);
+
+// Dequantize NVFP4 weights back to float (CPU version)
+void dequantize_nvfp4_cpu(
+    const NVFP4Block* quantized_blocks,
+    float* weights,
+    int total_size
+);
+
 __global__ void dequantize_blockwise_kernel(
     const int8_t* W_quantized,
     const float* scales,
@@ -82,6 +106,13 @@ __global__ void dequantize_blockwise_kernel(
 // MXFP4 GPU dequantization kernel
 __global__ void dequantize_mxfp4_kernel(
     const MXFP4Block* W_quantized,
+    float* W_dequantized,
+    int total_size
+);
+
+// NVFP4 GPU dequantization kernel
+__global__ void dequantize_nvfp4_kernel(
+    const NVFP4Block* W_quantized,
     float* W_dequantized,
     int total_size
 );
@@ -198,6 +229,25 @@ __global__ void fused_nf4_qkv_projection_kernel(
     const NF4Block* __restrict__ Wq_quantized,
     const NF4Block* __restrict__ Wk_quantized,
     const NF4Block* __restrict__ Wv_quantized,
+    const float* __restrict__ bq,
+    const float* __restrict__ bk,
+    const float* __restrict__ bv,
+    float* __restrict__ Q,
+    float* __restrict__ K,
+    float* __restrict__ V,
+    int batch,
+    int seq_len,
+    int d_model,
+    int d_k,
+    int d_v
+);
+
+// Fused NVFP4 Dequantization + QKV Projection Kernel
+__global__ void fused_nvfp4_qkv_projection_kernel(
+    const float* __restrict__ X,
+    const NVFP4Block* __restrict__ Wq_quantized,
+    const NVFP4Block* __restrict__ Wk_quantized,
+    const NVFP4Block* __restrict__ Wv_quantized,
     const float* __restrict__ bq,
     const float* __restrict__ bk,
     const float* __restrict__ bv,

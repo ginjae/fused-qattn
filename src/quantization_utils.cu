@@ -187,6 +187,85 @@ void dequantize_nf4_cpu(
 }
 
 // ============================================================================
+// FP8 E4M3 Helper Functions (for NVFP4)
+// ============================================================================
+
+// Convert float to FP8 E4M3 format (used for NVFP4 scale factors)
+// E4M3: 1 sign bit, 4 exponent bits, 3 mantissa bits, bias=7
+__host__ __device__ inline uint8_t float_to_fp8_e4m3(float value) {
+    if (value == 0.0f) return 0;
+    
+    uint32_t bits = *reinterpret_cast<uint32_t*>(&value);
+    uint8_t sign = (bits >> 31) & 0x1;
+    int exp = ((bits >> 23) & 0xFF) - 127;  // Unbias FP32 exponent
+    uint32_t mantissa = bits & 0x7FFFFF;
+    
+    // E4M3 bias is 7, range is [-6, 15] (exponent values 0-15)
+    // Adjust exponent for E4M3 bias
+    exp += 7;
+    
+    // Handle overflow (exp >= 16)
+    if (exp >= 15) {  // Max normal exponent for E4M3 is 15 (no infinities in E4M3)
+        // Clamp to max value: S 1111 111 = ±448
+        return (sign << 7) | 0x7F;
+    }
+    
+    // Handle underflow (exp <= 0)
+    if (exp <= 0) {
+        // Subnormal or zero
+        if (exp < -3) return (sign << 7);  // Flush to zero
+        
+        // Subnormal: shift mantissa right and set exp to 0
+        int shift = 1 - exp;  // How many positions to shift
+        mantissa = (1 << 23) | mantissa;  // Add implicit 1
+        mantissa >>= (20 + shift);  // Shift to 3-bit mantissa + denorm shift
+        return (sign << 7) | (mantissa & 0x7);
+    }
+    
+    // Normal case: round mantissa from 23 bits to 3 bits
+    // Round to nearest, ties to even
+    uint32_t mantissa_3bit = mantissa >> 20;  // Top 3 bits
+    uint32_t round_bit = (mantissa >> 19) & 0x1;
+    uint32_t sticky_bits = mantissa & 0x7FFFF;
+    
+    if (round_bit && (sticky_bits != 0 || (mantissa_3bit & 0x1))) {
+        mantissa_3bit++;
+        if (mantissa_3bit > 7) {
+            mantissa_3bit = 0;
+            exp++;
+            if (exp >= 15) {
+                return (sign << 7) | 0x7F;  // Overflow to max
+            }
+        }
+    }
+    
+    return (sign << 7) | (exp << 3) | (mantissa_3bit & 0x7);
+}
+
+// Convert FP8 E4M3 to float
+__host__ __device__ inline float fp8_e4m3_to_float(uint8_t fp8_val) {
+    uint8_t sign = (fp8_val >> 7) & 0x1;
+    uint8_t exp = (fp8_val >> 3) & 0xF;
+    uint8_t mantissa = fp8_val & 0x7;
+    
+    if (exp == 0) {
+        if (mantissa == 0) {
+            // Zero
+            return sign ? -0.0f : 0.0f;
+        }
+        // Subnormal: value = (-1)^S × 2^(-6) × (0.mantissa)
+        float val = mantissa / 8.0f;  // 0.mantissa in base-2
+        val *= powf(2.0f, -6.0f);
+        return sign ? -val : val;
+    }
+    
+    // Normal: value = (-1)^S × 2^(E-7) × (1.mantissa)
+    float val = 1.0f + mantissa / 8.0f;
+    val *= powf(2.0f, (int)exp - 7);
+    return sign ? -val : val;
+}
+
+// ============================================================================
 // MXFP4 Quantization Implementation
 // ============================================================================
 
@@ -459,6 +538,12 @@ __constant__ float NF4_QUANT_TABLE_GPU[16] = {
     1.0f
 };
 
+// GPU constant memory for NVFP4 E2M1 lookup table
+__constant__ float NVFP4_E2M1_TABLE_GPU[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+};
+
 // GPU Kernel for NF4 Dequantization
 // Dequantizes NF4 weights to float
 // W_quantized: [num_blocks] NF4 blocks
@@ -520,6 +605,170 @@ __global__ void dequantize_mxfp4_kernel(
         }
         
         W_dequantized[idx] = fp4_mantissa_to_float(fp4_val, shared_exp);
+    }
+}
+
+// ============================================================================
+// NVFP4 Quantization Implementation
+// ============================================================================
+
+// E2M1 lookup table for NVFP4 - CPU version
+// Format: S EE M where S=sign, E=exponent(2 bits), M=mantissa(1 bit)
+// Positive values: 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0
+static const float NVFP4_E2M1_TABLE_CPU[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,  // Positive (S=0)
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f  // Negative (S=1)
+};
+
+// Helper function to convert float to FP4 mantissa with E4M3 scaling (NVFP4 format)
+// NVFP4 uses simple multiplication: x = x_q × scale, where x_q is E2M1 in range [-6, 6]
+inline uint8_t float_to_nvfp4_mantissa(float value, float scale_e4m3) {
+    if (scale_e4m3 < 1e-10f || value == 0.0f) return 0;
+    
+    // Scale the value: x_q = value / scale
+    float scaled = value / scale_e4m3;
+    
+    // Clamp to E2M1 range [-6, 6]
+    if (scaled > 6.0f) scaled = 6.0f;
+    if (scaled < -6.0f) scaled = -6.0f;
+    
+    // Find closest E2M1 value
+    uint8_t best_idx = 0;
+    float min_dist = fabsf(scaled - NVFP4_E2M1_TABLE_CPU[0]);
+    
+    for (int i = 1; i < 16; i++) {
+        float dist = fabsf(scaled - NVFP4_E2M1_TABLE_CPU[i]);
+        if (dist < min_dist) {
+            min_dist = dist;
+            best_idx = i;
+        }
+    }
+    
+    return best_idx;
+}
+
+// Helper function to convert NVFP4 mantissa back to float (CPU version)
+inline float nvfp4_mantissa_to_float(uint8_t fp4_val, float scale_e4m3) {
+    if (fp4_val >= 16) fp4_val = 15;  // Clamp to valid range
+    
+    // Direct lookup from E2M1 table
+    float unscaled = NVFP4_E2M1_TABLE_CPU[fp4_val];
+    
+    // Apply scale: x = x_q × scale
+    return unscaled * scale_e4m3;
+}
+
+// CPU function to quantize weights to NVFP4 format
+void quantize_nvfp4(
+    const float* weights,
+    NVFP4Block* quantized_blocks,
+    int total_size
+) {
+    int num_blocks = (total_size + NVFP4_BLOCK_SIZE - 1) / NVFP4_BLOCK_SIZE;
+    
+    for (int b = 0; b < num_blocks; b++) {
+        int start = b * NVFP4_BLOCK_SIZE;
+        int end = std::min(start + NVFP4_BLOCK_SIZE, total_size);
+        
+        // Find the maximum absolute value in this block
+        float max_abs = 0.0f;
+        for (int i = start; i < end; i++) {
+            float abs_val = fabsf(weights[i]);
+            if (abs_val > max_abs) max_abs = abs_val;
+        }
+        
+        // Compute E4M3 scale factor
+        // Target: scale max_abs to fit in FP4 range [0, 6.0]
+        // Scale = max_abs / 6.0, but we want the optimal E4M3 scale
+        // that minimizes quantization error across the block
+        
+        float target_scale = (max_abs > 1e-10f) ? (max_abs / 6.0f) : 1e-10f;
+        
+        // Quantize scale to E4M3 format
+        uint8_t scale_e4m3_bits = float_to_fp8_e4m3(target_scale);
+        quantized_blocks[b].scale_e4m3 = scale_e4m3_bits;
+        
+        // Dequantize to get actual scale
+        float actual_scale = fp8_e4m3_to_float(scale_e4m3_bits);
+        
+        // Quantize each value in the block
+        for (int i = 0; i < NVFP4_BLOCK_SIZE; i++) {
+            int idx = start + i;
+            float value = (idx < total_size) ? weights[idx] : 0.0f;
+            
+            uint8_t nvfp4_val = float_to_nvfp4_mantissa(value, actual_scale);
+            
+            // Pack 2 values per byte
+            if (i % 2 == 0) {
+                quantized_blocks[b].data[i / 2] = nvfp4_val << 4;
+            } else {
+                quantized_blocks[b].data[i / 2] |= nvfp4_val;
+            }
+        }
+    }
+}
+
+// CPU function to dequantize NVFP4 weights back to float
+void dequantize_nvfp4_cpu(
+    const NVFP4Block* quantized_blocks,
+    float* weights,
+    int total_size
+) {
+    int num_blocks = (total_size + NVFP4_BLOCK_SIZE - 1) / NVFP4_BLOCK_SIZE;
+    
+    for (int b = 0; b < num_blocks; b++) {
+        int start = b * NVFP4_BLOCK_SIZE;
+        int end = std::min(start + NVFP4_BLOCK_SIZE, total_size);
+        
+        // Dequantize E4M3 scale
+        float scale_e4m3 = fp8_e4m3_to_float(quantized_blocks[b].scale_e4m3);
+        
+        for (int i = 0; i < NVFP4_BLOCK_SIZE && (start + i) < total_size; i++) {
+            // Unpack 4-bit value
+            uint8_t nvfp4_val;
+            if (i % 2 == 0) {
+                nvfp4_val = (quantized_blocks[b].data[i / 2] >> 4) & 0xF;
+            } else {
+                nvfp4_val = quantized_blocks[b].data[i / 2] & 0xF;
+            }
+            
+            weights[start + i] = nvfp4_mantissa_to_float(nvfp4_val, scale_e4m3);
+        }
+    }
+}
+
+// ============================================================================
+// NVFP4 GPU Kernels
+// ============================================================================
+
+// GPU Kernel for NVFP4 Dequantization
+// Dequantizes NVFP4 weights to float
+// W_quantized: [num_blocks] NVFP4 blocks
+// W_dequantized: [total_size] output float values
+__global__ void dequantize_nvfp4_kernel(
+    const NVFP4Block* W_quantized,
+    float* W_dequantized,
+    int total_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx < total_size) {
+        int block_idx = idx / NVFP4_BLOCK_SIZE;
+        int local_idx = idx % NVFP4_BLOCK_SIZE;
+        
+        float scale_e4m3 = fp8_e4m3_to_float(W_quantized[block_idx].scale_e4m3);
+        
+        // Unpack 4-bit value
+        uint8_t nvfp4_val;
+        if (local_idx % 2 == 0) {
+            nvfp4_val = (W_quantized[block_idx].data[local_idx / 2] >> 4) & 0xF;
+        } else {
+            nvfp4_val = W_quantized[block_idx].data[local_idx / 2] & 0xF;
+        }
+        
+        // Dequantize using lookup table: x = x_q × scale
+        if (nvfp4_val >= 16) nvfp4_val = 15;
+        W_dequantized[idx] = NVFP4_E2M1_TABLE_GPU[nvfp4_val] * scale_e4m3;
     }
 }
 
@@ -1174,3 +1423,157 @@ __global__ void fused_mxfp4_qkv_projection_kernel(
     }
 }
 
+// ============================================================================
+// Fused NVFP4 Dequantization + QKV Projection Kernel
+// ============================================================================
+
+// Kernel: Fused NVFP4 Dequantization + QKV Projection
+// Performs on-the-fly NVFP4 dequantization during matrix multiplication
+// X: [batch, seq_len, d_model]
+// Wq_quantized, Wk_quantized, Wv_quantized: NVFP4Block arrays
+// Q, K, V: [batch, seq_len, d_k/d_v]
+__global__ void fused_nvfp4_qkv_projection_kernel(
+    const float* __restrict__ X,
+    const NVFP4Block* __restrict__ Wq_quantized,
+    const NVFP4Block* __restrict__ Wk_quantized,
+    const NVFP4Block* __restrict__ Wv_quantized,
+    const float* __restrict__ bq,
+    const float* __restrict__ bk,
+    const float* __restrict__ bv,
+    float* __restrict__ Q,
+    float* __restrict__ K,
+    float* __restrict__ V,
+    int batch,
+    int seq_len,
+    int d_model,
+    int d_k,
+    int d_v
+) {
+    // Padded shared memory to avoid bank conflicts
+    __shared__ float X_tile[TILE_SIZE][TILE_SIZE + 1];
+    __shared__ float Wq_tile[TILE_SIZE][TILE_SIZE + 1];
+    __shared__ float Wk_tile[TILE_SIZE][TILE_SIZE + 1];
+    __shared__ float Wv_tile[TILE_SIZE][TILE_SIZE + 1];
+
+    const int b_idx = blockIdx.z;
+    const int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    const int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+
+    float sum_q = 0.0f;
+    float sum_k = 0.0f;
+    float sum_v = 0.0f;
+
+    // Pre-compute base index for X access
+    const int x_base = b_idx * seq_len * d_model + row * d_model;
+
+    for (int t = 0; t < (d_model + TILE_SIZE - 1) / TILE_SIZE; t++) {
+        // 1. Load X tile once (shared for all three projections)
+        const int x_col = t * TILE_SIZE + threadIdx.x;
+        if (b_idx < batch && row < seq_len && x_col < d_model) {
+            X_tile[threadIdx.y][threadIdx.x] = __ldg(&X[x_base + x_col]);
+        } else {
+            X_tile[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        const int w_row = t * TILE_SIZE + threadIdx.y;
+        const int w_col = col;
+
+        // 2. Load and dequantize ALL weight tiles in parallel
+        // Dequantize Wq from NVFP4
+        if (w_row < d_model && w_col < d_k) {
+            const int wq_idx = w_row * d_k + w_col;
+            const int block_idx = wq_idx / NVFP4_BLOCK_SIZE;
+            const int local_idx = wq_idx % NVFP4_BLOCK_SIZE;
+            
+            const float scale_e4m3 = fp8_e4m3_to_float(Wq_quantized[block_idx].scale_e4m3);
+            
+            // Unpack 4-bit value
+            uint8_t nvfp4_val;
+            if (local_idx % 2 == 0) {
+                nvfp4_val = (Wq_quantized[block_idx].data[local_idx / 2] >> 4) & 0xF;
+            } else {
+                nvfp4_val = Wq_quantized[block_idx].data[local_idx / 2] & 0xF;
+            }
+            
+            if (nvfp4_val >= 16) nvfp4_val = 15;
+            Wq_tile[threadIdx.y][threadIdx.x] = NVFP4_E2M1_TABLE_GPU[nvfp4_val] * scale_e4m3;
+
+            // Dequantize Wk from NVFP4
+            const int wk_idx = w_row * d_k + w_col;
+            const int block_idx_k = wk_idx / NVFP4_BLOCK_SIZE;
+            const int local_idx_k = wk_idx % NVFP4_BLOCK_SIZE;
+            
+            const float scale_e4m3_k = fp8_e4m3_to_float(Wk_quantized[block_idx_k].scale_e4m3);
+            
+            uint8_t nvfp4_val_k;
+            if (local_idx_k % 2 == 0) {
+                nvfp4_val_k = (Wk_quantized[block_idx_k].data[local_idx_k / 2] >> 4) & 0xF;
+            } else {
+                nvfp4_val_k = Wk_quantized[block_idx_k].data[local_idx_k / 2] & 0xF;
+            }
+            
+            if (nvfp4_val_k >= 16) nvfp4_val_k = 15;
+            Wk_tile[threadIdx.y][threadIdx.x] = NVFP4_E2M1_TABLE_GPU[nvfp4_val_k] * scale_e4m3_k;
+        } else {
+            Wq_tile[threadIdx.y][threadIdx.x] = 0.0f;
+            Wk_tile[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        // Dequantize Wv from NVFP4
+        if (w_row < d_model && w_col < d_v) {
+            const int wv_idx = w_row * d_v + w_col;
+            const int block_idx_v = wv_idx / NVFP4_BLOCK_SIZE;
+            const int local_idx_v = wv_idx % NVFP4_BLOCK_SIZE;
+            
+            const float scale_e4m3_v = fp8_e4m3_to_float(Wv_quantized[block_idx_v].scale_e4m3);
+            
+            uint8_t nvfp4_val_v;
+            if (local_idx_v % 2 == 0) {
+                nvfp4_val_v = (Wv_quantized[block_idx_v].data[local_idx_v / 2] >> 4) & 0xF;
+            } else {
+                nvfp4_val_v = Wv_quantized[block_idx_v].data[local_idx_v / 2] & 0xF;
+            }
+            
+            if (nvfp4_val_v >= 16) nvfp4_val_v = 15;
+            Wv_tile[threadIdx.y][threadIdx.x] = NVFP4_E2M1_TABLE_GPU[nvfp4_val_v] * scale_e4m3_v;
+        } else {
+            Wv_tile[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        // 3. Single sync after all loads
+        __syncthreads();
+
+        // 4. Compute all three matmuls together
+        for (int k = 0; k < TILE_SIZE; k++) {
+            float x_val = X_tile[threadIdx.y][k];
+            sum_q = __fmaf_rn(x_val, Wq_tile[k][threadIdx.x], sum_q);
+            sum_k = __fmaf_rn(x_val, Wk_tile[k][threadIdx.x], sum_k);
+            sum_v = __fmaf_rn(x_val, Wv_tile[k][threadIdx.x], sum_v);
+        }
+        __syncthreads();
+    }
+
+    // Write Q result with bias (coalesced writes)
+    if (b_idx < batch && row < seq_len && col < d_k) {
+        if (bq != nullptr) {
+            sum_q = __fmaf_rn(1.0f, __ldg(&bq[col]), sum_q);
+        }
+        Q[b_idx * seq_len * d_k + row * d_k + col] = sum_q;
+    }
+
+    // Write K result with bias
+    if (b_idx < batch && row < seq_len && col < d_k) {
+        if (bk != nullptr) {
+            sum_k = __fmaf_rn(1.0f, __ldg(&bk[col]), sum_k);
+        }
+        K[b_idx * seq_len * d_k + row * d_k + col] = sum_k;
+    }
+
+    // Write V result with bias
+    if (b_idx < batch && row < seq_len && col < d_v) {
+        if (bv != nullptr) {
+            sum_v = __fmaf_rn(1.0f, __ldg(&bv[col]), sum_v);
+        }
+        V[b_idx * seq_len * d_v + row * d_v + col] = sum_v;
+    }
+}

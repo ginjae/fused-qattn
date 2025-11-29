@@ -846,8 +846,8 @@ int main() {
     compute_error_metrics("Our MXFP4 vs Naive MXFP4", h_naive_baseline_mxfp4, h_result_temp, 
                          batch, seq_len, d_v, UNQUANTIZED);
 
-
     printf("\n");
+
     printf("\n=== Quantized Weights Tests (NF4) ===\n");
 
     // Quantize weights to NF4
@@ -1061,6 +1061,44 @@ int main() {
     // Compare with baseline (both NF4, should match closely)
     compute_error_metrics("Our NF4 vs Naive NF4", h_naive_baseline_nf4, h_result_temp, 
                          batch, seq_len, d_v, UNQUANTIZED);
+
+    printf("\n");
+
+    printf("\n=== Quantized Weights Tests (NVFP4) ===\n");
+
+    // Quantize weights to NVFP4
+    printf("\n== Quantizing Weights to NVFP4 ==\n");
+    int num_blocks_q_nvfp4 = (d_model * d_k + NVFP4_BLOCK_SIZE - 1) / NVFP4_BLOCK_SIZE;
+    int num_blocks_v_nvfp4 = (d_model * d_v + NVFP4_BLOCK_SIZE - 1) / NVFP4_BLOCK_SIZE;
+
+    NVFP4Block* h_Wq_nvfp4 = (NVFP4Block*)malloc(num_blocks_q_nvfp4 * sizeof(NVFP4Block));
+    NVFP4Block* h_Wk_nvfp4 = (NVFP4Block*)malloc(num_blocks_q_nvfp4 * sizeof(NVFP4Block));
+    NVFP4Block* h_Wv_nvfp4 = (NVFP4Block*)malloc(num_blocks_v_nvfp4 * sizeof(NVFP4Block));
+    quantize_nvfp4(h_Wq, h_Wq_nvfp4, d_model * d_k);
+    quantize_nvfp4(h_Wk, h_Wk_nvfp4, d_model * d_k);
+    quantize_nvfp4(h_Wv, h_Wv_nvfp4, d_model * d_v);
+
+    printf("NVFP4 Block size: %d\n", NVFP4_BLOCK_SIZE);
+    printf("Num NVFP4 blocks (Q/K): %d, Num NVFP4 blocks (V): %d\n", num_blocks_q_nvfp4, num_blocks_v_nvfp4);
+    printf("NVFP4 Quantization complete.\n");
+    
+    // Test NVFP4 quantization accuracy
+    h_Wq_dequant_test = (float*)malloc(wq_size);
+    dequantize_nvfp4_cpu(h_Wq_nvfp4, h_Wq_dequant_test, d_model * d_k);
+    double nvfp4_test_error = 0.0;
+    double nvfp4_test_sum_sq = 0.0;
+    for (int i = 0; i < d_model * d_k; i++) {
+        double diff = h_Wq[i] - h_Wq_dequant_test[i];
+        nvfp4_test_error += diff * diff;
+        nvfp4_test_sum_sq += h_Wq[i] * h_Wq[i];
+    }
+    double nvfp4_relative_error = sqrt(nvfp4_test_error / nvfp4_test_sum_sq);
+    printf("NVFP4 Weight Quantization Error: %.6e (%.2f%%)\n", nvfp4_relative_error, nvfp4_relative_error * 100);
+    free(h_Wq_dequant_test);
+
+
+
+
 
 
     // Print summary table
