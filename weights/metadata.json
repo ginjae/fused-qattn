@@ -1,0 +1,30 @@
+{
+  "model_name": "gpt2",
+  "layer_idx": 0,
+  "head_idx": 0,
+  "n_embd": 768,
+  "d_head": 64,
+  "n_head": 12,
+  "n_layer": 12,
+  "wq_shape": [
+    768,
+    64
+  ],
+  "wk_shape": [
+    768,
+    64
+  ],
+  "wv_shape": [
+    768,
+    64
+  ],
+  "bq_shape": [
+    64
+  ],
+  "bk_shape": [
+    64
+  ],
+  "bv_shape": [
+    64
+  ]
+}

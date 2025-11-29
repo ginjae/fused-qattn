@@ -5,6 +5,37 @@ The core objective is to integrate **dequantization** and **attention operations
 > This project was implemented using CUDA 12.4.
 
 
+## 🚀 Quick Start
+
+### Extract Real GPT-2 Weights (Recommended)
+
+For more realistic evaluation, you can use actual GPT-2 attention weights:
+
+```bash
+# Install required dependencies
+pip install torch transformers numpy
+
+# Extract weights from GPT-2 (layer 0, head 0 by default)
+python extract_gpt2_weights.py --output weights
+
+# Or specify different layer/head
+python extract_gpt2_weights.py --model gpt2 --layer 0 --head 0 --output weights
+```
+
+This will create a `weights/` directory containing:
+- `wq.npy`, `wk.npy`, `wv.npy` - Query, Key, Value projection matrices
+- `bq.npy`, `bk.npy`, `bv.npy` - Corresponding biases
+- `metadata.json` - Weight metadata
+
+The evaluation code will automatically load these weights if available, otherwise it falls back to random initialization.
+
+### Build and Run
+
+```bash
+make run_eval
+```
+
+
 ## 🚀 Overview
 
 Attention in modern Large Language Models (LLMs) is fundamentally **memory-bound**, as it requires multiple passes over large activation and weight tensors across several independent CUDA kernels. When using **block-wise weight-only quantization** formats such as NF4, MXFP4, or NVFP4, an additional overhead is introduced by **dequantization**, which is typically executed as a standalone kernel. This increases global memory traffic and undermines the data locality necessary for high-throughput inference.
@@ -36,7 +67,7 @@ There are six kernel functions, each of which is for:
 4. Scaling: $QK^\top\over{\sqrt{d_k}}$
 
     \+
-    Causal masking
+    Causal masking (Optional)
 5. $\text{softmax}({QK^\top\over{\sqrt{d_k}}})$
 6. Naïve matmul: $\text{Attention}(Q, K, V) = \text{softmax}({QK^\top\over{\sqrt{d_k}}}) V$ 
 
@@ -50,7 +81,7 @@ There are six kernel functions, each of which is for:
 4. Scaling: $QK^\top\over{\sqrt{d_k}}$
 
     \+
-    Causal masking
+    Causal masking (Optional)
 5. $\text{chunk-wise softmax}({QK^\top\over{\sqrt{d_k}}})$
 6. Tiled matmul: $\text{Attention}(Q, K, V) = \text{chunk-wise softmax}({QK^\top\over{\sqrt{d_k}}}) V$
 
@@ -66,7 +97,7 @@ There are three kernel functions, each of which is for:
     Scaling: $QK^\top\over{\sqrt{d_k}}$
 
     \+
-    Causal masking
+    Causal masking (Optional)
 
     \+
     $\text{chunk-wise softmax}({QK^\top\over{\sqrt{d_k}}})$
@@ -89,7 +120,7 @@ There are two kernel functions, each of which is for:
     Scaling: $QK^\top\over{\sqrt{d_k}}$
 
     \+
-    Causal masking
+    Causal masking (Optional)
 
     \+
     $\text{chunk-wise softmax}({QK^\top\over{\sqrt{d_k}}})$
