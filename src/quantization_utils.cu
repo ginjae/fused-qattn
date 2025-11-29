@@ -1293,7 +1293,7 @@ __global__ void fused_nf4_qkv_projection_kernel(
     // Write Q result with bias (coalesced writes)
     if (b_idx < batch && row < seq_len && col < d_k) {
         if (bq != nullptr) {
-            sum_q = __fmaf_rn(1.0f, __ldg(&bq[col]), sum_q);
+            sum_q += __ldg(&bq[col]);
         }
         Q[b_idx * seq_len * d_k + row * d_k + col] = sum_q;
     }
@@ -1301,7 +1301,7 @@ __global__ void fused_nf4_qkv_projection_kernel(
     // Write K result with bias
     if (b_idx < batch && row < seq_len && col < d_k) {
         if (bk != nullptr) {
-            sum_k = __fmaf_rn(1.0f, __ldg(&bk[col]), sum_k);
+            sum_k += __ldg(&bk[col]);
         }
         K[b_idx * seq_len * d_k + row * d_k + col] = sum_k;
     }
@@ -1309,7 +1309,7 @@ __global__ void fused_nf4_qkv_projection_kernel(
     // Write V result with bias
     if (b_idx < batch && row < seq_len && col < d_v) {
         if (bv != nullptr) {
-            sum_v = __fmaf_rn(1.0f, __ldg(&bv[col]), sum_v);
+            sum_v += __ldg(&bv[col]);
         }
         V[b_idx * seq_len * d_v + row * d_v + col] = sum_v;
     }
@@ -1445,7 +1445,7 @@ __global__ void fused_mxfp4_qkv_projection_kernel(
     // Write Q result with bias (coalesced writes)
     if (b_idx < batch && row < seq_len && col < d_k) {
         if (bq != nullptr) {
-            sum_q = __fmaf_rn(1.0f, __ldg(&bq[col]), sum_q);
+            sum_q += __ldg(&bq[col]);
         }
         Q[b_idx * seq_len * d_k + row * d_k + col] = sum_q;
     }
@@ -1453,7 +1453,7 @@ __global__ void fused_mxfp4_qkv_projection_kernel(
     // Write K result with bias
     if (b_idx < batch && row < seq_len && col < d_k) {
         if (bk != nullptr) {
-            sum_k = __fmaf_rn(1.0f, __ldg(&bk[col]), sum_k);
+            sum_k += __ldg(&bk[col]);
         }
         K[b_idx * seq_len * d_k + row * d_k + col] = sum_k;
     }
@@ -1461,7 +1461,7 @@ __global__ void fused_mxfp4_qkv_projection_kernel(
     // Write V result with bias
     if (b_idx < batch && row < seq_len && col < d_v) {
         if (bv != nullptr) {
-            sum_v = __fmaf_rn(1.0f, __ldg(&bv[col]), sum_v);
+            sum_v += __ldg(&bv[col]);
         }
         V[b_idx * seq_len * d_v + row * d_v + col] = sum_v;
     }
@@ -1545,7 +1545,7 @@ __global__ void fused_nvfp4_qkv_projection_kernel(
                 nvfp4_val = Wq_quantized[block_idx].data[local_idx / 2] & 0xF;
             }
             
-            if (nvfp4_val >= 16) nvfp4_val = 15;
+            // if (nvfp4_val >= 16) nvfp4_val = 15;
             Wq_tile[threadIdx.y][threadIdx.x] = NVFP4_E2M1_TABLE_GPU[nvfp4_val] * combined_scale;
 
             // Dequantize Wk from NVFP4 with 2-level scaling
@@ -1563,7 +1563,7 @@ __global__ void fused_nvfp4_qkv_projection_kernel(
                 nvfp4_val_k = Wk_quantized[block_idx_k].data[local_idx_k / 2] & 0xF;
             }
             
-            if (nvfp4_val_k >= 16) nvfp4_val_k = 15;
+            // if (nvfp4_val_k >= 16) nvfp4_val_k = 15;
             Wk_tile[threadIdx.y][threadIdx.x] = NVFP4_E2M1_TABLE_GPU[nvfp4_val_k] * combined_scale_k;
         } else {
             Wq_tile[threadIdx.y][threadIdx.x] = 0.0f;
@@ -1586,7 +1586,7 @@ __global__ void fused_nvfp4_qkv_projection_kernel(
                 nvfp4_val_v = Wv_quantized[block_idx_v].data[local_idx_v / 2] & 0xF;
             }
             
-            if (nvfp4_val_v >= 16) nvfp4_val_v = 15;
+            // if (nvfp4_val_v >= 16) nvfp4_val_v = 15;
             Wv_tile[threadIdx.y][threadIdx.x] = NVFP4_E2M1_TABLE_GPU[nvfp4_val_v] * combined_scale_v;
         } else {
             Wv_tile[threadIdx.y][threadIdx.x] = 0.0f;
@@ -1608,7 +1608,7 @@ __global__ void fused_nvfp4_qkv_projection_kernel(
     // Write Q result with bias (coalesced writes)
     if (b_idx < batch && row < seq_len && col < d_k) {
         if (bq != nullptr) {
-            sum_q = __fmaf_rn(1.0f, __ldg(&bq[col]), sum_q);
+            sum_q += __ldg(&bq[col]);
         }
         Q[b_idx * seq_len * d_k + row * d_k + col] = sum_q;
     }
@@ -1616,7 +1616,7 @@ __global__ void fused_nvfp4_qkv_projection_kernel(
     // Write K result with bias
     if (b_idx < batch && row < seq_len && col < d_k) {
         if (bk != nullptr) {
-            sum_k = __fmaf_rn(1.0f, __ldg(&bk[col]), sum_k);
+            sum_k += __ldg(&bk[col]);
         }
         K[b_idx * seq_len * d_k + row * d_k + col] = sum_k;
     }
@@ -1624,7 +1624,7 @@ __global__ void fused_nvfp4_qkv_projection_kernel(
     // Write V result with bias
     if (b_idx < batch && row < seq_len && col < d_v) {
         if (bv != nullptr) {
-            sum_v = __fmaf_rn(1.0f, __ldg(&bv[col]), sum_v);
+            sum_v += __ldg(&bv[col]);
         }
         V[b_idx * seq_len * d_v + row * d_v + col] = sum_v;
     }
