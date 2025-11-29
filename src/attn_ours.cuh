@@ -45,4 +45,38 @@ void our_attention_quantized_blockwise(
     bool verbose
 );
 
+void our_attention_mxfp4(
+    const float* X,
+    const void* Wq_mxfp4,
+    const void* Wk_mxfp4,
+    const void* Wv_mxfp4,
+    const float* bq,
+    const float* bk,
+    const float* bv,
+    float* output,
+    int batch,
+    int seq_len,
+    int d_model,
+    int d_k,
+    int d_v,
+    bool verbose
+);
+
+void our_attention_nf4(
+    const float* d_X,
+    const void* d_Wq_nf4,
+    const void* d_Wk_nf4,
+    const void* d_Wv_nf4,
+    const float* d_bq,
+    const float* d_bk,
+    const float* d_bv,
+    float* d_output,
+    int batch,
+    int seq_len,
+    int d_model,
+    int d_k,
+    int d_v,
+    bool causal_mask = false
+);
+
 #endif // ATTN_OURS_CUH

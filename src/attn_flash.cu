@@ -192,6 +192,56 @@ static __global__ void flash_attention_kernel(
     }
 }
 
+void flash_attention(
+    const float* d_X,
+    const float* d_Wq,
+    const float* d_Wk,
+    const float* d_Wv,
+    const float* d_bq,
+    const float* d_bk,
+    const float* d_bv,
+    float* d_output,
+    int batch,
+    int seq_len,
+    int d_model,
+    int d_k,
+    int d_v,
+    bool causal_mask = false
+) {
+    // Allocate temporary buffers for Q, K, V, A (no need for QK anymore!)
+    float *d_Q, *d_K, *d_V;
+    CUDA_CHECK(cudaMalloc(&d_Q, batch * seq_len * d_k * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_K, batch * seq_len * d_k * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_V, batch * seq_len * d_v * sizeof(float)));
+
+    // Step 0: Compute Q, K, V using fused kernel for better arithmetic intensity
+    // Grid dimensions based on max(d_k, d_v) to handle all outputs
+    int max_d = (d_k > d_v) ? d_k : d_v;
+    dim3 block_fused(TILE_SIZE, TILE_SIZE);
+    dim3 grid_fused((max_d + TILE_SIZE - 1) / TILE_SIZE,
+                    (seq_len + TILE_SIZE - 1) / TILE_SIZE,
+                    batch);
+    fused_qkv_projection_tiled_kernel<<<grid_fused, block_fused>>>(
+        d_X, d_Wq, d_Wk, d_Wv, d_bq, d_bk, d_bv,
+        d_Q, d_K, d_V,
+        batch, seq_len, d_model, d_k, d_v);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Step 1 & 2 & 3 & 4 (FUSED): Q·Kᵀ MatMul + Scaling + Masking + Online Softmax + A·V MatMul
+    dim3 block_fused_qk(256);  // One block per row with 256 threads
+    dim3 grid_fused_qk(seq_len, batch);
+    const float scale_factor = rsqrtf((float)d_k);
+    size_t shared_bytes = seq_len * sizeof(float);
+    flash_attention_kernel<<<grid_fused_qk, block_fused_qk, shared_bytes>>>(
+        d_Q, d_K, d_V, d_output, batch, seq_len, d_k, d_v, scale_factor, causal_mask);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Free temporary buffers
+    CUDA_CHECK(cudaFree(d_Q));
+    CUDA_CHECK(cudaFree(d_K));
+    CUDA_CHECK(cudaFree(d_V));
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
 
 // Host function to perform complete tiled attention with quantized weight matrices
 void flash_attention_quantized_blockwise(
@@ -286,12 +336,11 @@ void flash_attention_quantized_blockwise(
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
-// Original host function (kept for backward compatibility)
-void flash_attention(
+void flash_attention_mxfp4(
     const float* d_X,
-    const float* d_Wq,
-    const float* d_Wk,
-    const float* d_Wv,
+    const void* d_Wq_mxfp4,
+    const void* d_Wk_mxfp4,
+    const void* d_Wv_mxfp4,
     const float* d_bq,
     const float* d_bk,
     const float* d_bv,
@@ -303,6 +352,34 @@ void flash_attention(
     int d_v,
     bool causal_mask = false
 ) {
+    const MXFP4Block* Wq_blocks = static_cast<const MXFP4Block*>(d_Wq_mxfp4);
+    const MXFP4Block* Wk_blocks = static_cast<const MXFP4Block*>(d_Wk_mxfp4);
+    const MXFP4Block* Wv_blocks = static_cast<const MXFP4Block*>(d_Wv_mxfp4);
+
+    // Allocate temporary buffers for dequantized weights
+    float *d_Wq, *d_Wk, *d_Wv;
+    CUDA_CHECK(cudaMalloc(&d_Wq, d_model * d_k * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_Wk, d_model * d_k * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_Wv, d_model * d_v * sizeof(float)));
+
+    // Dequantize MXFP4 weights
+    int total_size_q = d_model * d_k;
+    int total_size_v = d_model * d_v;
+    
+    dim3 block_dequant(256);
+    dim3 grid_wq((total_size_q + block_dequant.x - 1) / block_dequant.x);
+    dim3 grid_wk((total_size_q + block_dequant.x - 1) / block_dequant.x);
+    dim3 grid_wv((total_size_v + block_dequant.x - 1) / block_dequant.x);
+    
+    dequantize_mxfp4_kernel<<<grid_wq, block_dequant>>>(Wq_blocks, d_Wq, total_size_q);
+    CUDA_CHECK(cudaGetLastError());
+    
+    dequantize_mxfp4_kernel<<<grid_wk, block_dequant>>>(Wk_blocks, d_Wk, total_size_q);
+    CUDA_CHECK(cudaGetLastError());
+    
+    dequantize_mxfp4_kernel<<<grid_wv, block_dequant>>>(Wv_blocks, d_Wv, total_size_v);
+    CUDA_CHECK(cudaGetLastError());
+    
     // Allocate temporary buffers for Q, K, V, A (no need for QK anymore!)
     float *d_Q, *d_K, *d_V;
     CUDA_CHECK(cudaMalloc(&d_Q, batch * seq_len * d_k * sizeof(float)));
@@ -330,10 +407,95 @@ void flash_attention(
     flash_attention_kernel<<<grid_fused_qk, block_fused_qk, shared_bytes>>>(
         d_Q, d_K, d_V, d_output, batch, seq_len, d_k, d_v, scale_factor, causal_mask);
     CUDA_CHECK(cudaGetLastError());
-
+    
     // Free temporary buffers
     CUDA_CHECK(cudaFree(d_Q));
     CUDA_CHECK(cudaFree(d_K));
     CUDA_CHECK(cudaFree(d_V));
+    CUDA_CHECK(cudaFree(d_Wq));
+    CUDA_CHECK(cudaFree(d_Wk));
+    CUDA_CHECK(cudaFree(d_Wv));
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+void flash_attention_nf4(
+    const float* d_X,
+    const void* d_Wq_nf4,
+    const void* d_Wk_nf4,
+    const void* d_Wv_nf4,
+    const float* d_bq,
+    const float* d_bk,
+    const float* d_bv,
+    float* d_output,
+    int batch,
+    int seq_len,
+    int d_model,
+    int d_k,
+    int d_v,
+    bool causal_mask = false
+) {
+    const NF4Block* Wq_blocks = static_cast<const NF4Block*>(d_Wq_nf4);
+    const NF4Block* Wk_blocks = static_cast<const NF4Block*>(d_Wk_nf4);
+    const NF4Block* Wv_blocks = static_cast<const NF4Block*>(d_Wv_nf4);
+
+    // Allocate temporary buffers for dequantized weights
+    float *d_Wq, *d_Wk, *d_Wv;
+    CUDA_CHECK(cudaMalloc(&d_Wq, d_model * d_k * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_Wk, d_model * d_k * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_Wv, d_model * d_v * sizeof(float)));
+
+    // Dequantize MXFP4 weights
+    int total_size_q = d_model * d_k;
+    int total_size_v = d_model * d_v;
+    
+    dim3 block_dequant(256);
+    dim3 grid_wq((total_size_q + block_dequant.x - 1) / block_dequant.x);
+    dim3 grid_wk((total_size_q + block_dequant.x - 1) / block_dequant.x);
+    dim3 grid_wv((total_size_v + block_dequant.x - 1) / block_dequant.x);
+    
+    dequantize_nf4_kernel<<<grid_wq, block_dequant>>>(Wq_blocks, d_Wq, total_size_q);
+    CUDA_CHECK(cudaGetLastError());
+    
+    dequantize_nf4_kernel<<<grid_wk, block_dequant>>>(Wk_blocks, d_Wk, total_size_q);
+    CUDA_CHECK(cudaGetLastError());
+    
+    dequantize_nf4_kernel<<<grid_wv, block_dequant>>>(Wv_blocks, d_Wv, total_size_v);
+    CUDA_CHECK(cudaGetLastError());
+    
+    // Allocate temporary buffers for Q, K, V, A (no need for QK anymore!)
+    float *d_Q, *d_K, *d_V;
+    CUDA_CHECK(cudaMalloc(&d_Q, batch * seq_len * d_k * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_K, batch * seq_len * d_k * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_V, batch * seq_len * d_v * sizeof(float)));
+
+    // Step 0: Compute Q, K, V using fused kernel for better arithmetic intensity
+    // Grid dimensions based on max(d_k, d_v) to handle all outputs
+    int max_d = (d_k > d_v) ? d_k : d_v;
+    dim3 block_fused(TILE_SIZE, TILE_SIZE);
+    dim3 grid_fused((max_d + TILE_SIZE - 1) / TILE_SIZE,
+                    (seq_len + TILE_SIZE - 1) / TILE_SIZE,
+                    batch);
+    fused_qkv_projection_tiled_kernel<<<grid_fused, block_fused>>>(
+        d_X, d_Wq, d_Wk, d_Wv, d_bq, d_bk, d_bv,
+        d_Q, d_K, d_V,
+        batch, seq_len, d_model, d_k, d_v);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Step 1 & 2 & 3 & 4 (FUSED): Q·Kᵀ MatMul + Scaling + Masking + Online Softmax + A·V MatMul
+    dim3 block_fused_qk(256);  // One block per row with 256 threads
+    dim3 grid_fused_qk(seq_len, batch);
+    const float scale_factor = rsqrtf((float)d_k);
+    size_t shared_bytes = seq_len * sizeof(float);
+    flash_attention_kernel<<<grid_fused_qk, block_fused_qk, shared_bytes>>>(
+        d_Q, d_K, d_V, d_output, batch, seq_len, d_k, d_v, scale_factor, causal_mask);
+    CUDA_CHECK(cudaGetLastError());
+    
+    // Free temporary buffers
+    CUDA_CHECK(cudaFree(d_Q));
+    CUDA_CHECK(cudaFree(d_K));
+    CUDA_CHECK(cudaFree(d_V));
+    CUDA_CHECK(cudaFree(d_Wq));
+    CUDA_CHECK(cudaFree(d_Wk));
+    CUDA_CHECK(cudaFree(d_Wv));
     CUDA_CHECK(cudaDeviceSynchronize());
 }
