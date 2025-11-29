@@ -20,13 +20,13 @@ Cooling down GPU for 1 seconds...
 1. Naive Attention (BASELINE)
 Running dummy run for warm-up...
 Running 100 iterations...
-Median execution time: 0.2212 ms
+Median execution time: 0.2171 ms
 Cooling down GPU for 1 seconds...
 
 2. Tiled Attention
 Running dummy run for warm-up...
 Running 100 iterations...
-Median execution time: 0.1403 ms
+Median execution time: 0.1382 ms
   Tiled vs Naive Correctness Check:
     Max Absolute Error: 7.152557e-07
     Mean Absolute Error: 4.668544e-08
@@ -38,7 +38,7 @@ Cooling down GPU for 1 seconds...
 3. Flash-style Attention
 Running dummy run for warm-up...
 Running 100 iterations...
-Median execution time: 0.1178 ms
+Median execution time: 0.1167 ms
   Flash vs Naive Correctness Check:
     Max Absolute Error: 7.748604e-06
     Mean Absolute Error: 2.833742e-07
@@ -61,13 +61,13 @@ Cooling down GPU for 1 seconds...
 1. Naive Attention (MXFP4)
 Running dummy run for warm-up...
 Running 100 iterations...
-Median execution time: 0.2488 ms
+Median execution time: 0.2673 ms
 Cooling down GPU for 1 seconds...
 
 2. Tiled Attention (MXFP4)
 Running dummy run for warm-up...
 Running 100 iterations...
-Median execution time: 0.1884 ms
+Median execution time: 0.1853 ms
   Tiled MXFP4 vs Naive MXFP4 Correctness Check:
     Max Absolute Error: 7.152557e-07
     Mean Absolute Error: 3.782713e-08
@@ -79,7 +79,7 @@ Cooling down GPU for 1 seconds...
 3. Flash-style Attention (MXFP4)
 Running dummy run for warm-up...
 Running 100 iterations...
-Median execution time: 0.1659 ms
+Median execution time: 0.1608 ms
   Flash MXFP4 vs Naive MXFP4 Correctness Check:
     Max Absolute Error: 1.424551e-05
     Mean Absolute Error: 3.343110e-07
@@ -91,7 +91,7 @@ Cooling down GPU for 1 seconds...
 4. Our Attention (MXFP4)
 Running dummy run for warm-up...
 Running 100 iterations...
-Median execution time: 0.1260 ms
+Median execution time: 0.1239 ms
   Our MXFP4 vs Naive MXFP4 Correctness Check:
     Max Absolute Error: 1.424551e-05
     Mean Absolute Error: 3.343110e-07
@@ -113,13 +113,13 @@ Cooling down GPU for 1 seconds...
 1. Naive Attention (NF4)
 Running dummy run for warm-up...
 Running 100 iterations...
-Median execution time: 0.2775 ms
+Median execution time: 0.2509 ms
 Cooling down GPU for 1 seconds...
 
 2. Tiled Attention (NF4)
 Running dummy run for warm-up...
 Running 100 iterations...
-Median execution time: 0.1884 ms
+Median execution time: 0.1853 ms
   Tiled NF4 vs Naive NF4 Correctness Check:
     Max Absolute Error: 1.907349e-06
     Mean Absolute Error: 3.667683e-08
@@ -131,7 +131,7 @@ Cooling down GPU for 1 seconds...
 3. Flash-style Attention (NF4)
 Running dummy run for warm-up...
 Running 100 iterations...
-Median execution time: 0.1659 ms
+Median execution time: 0.1618 ms
   Flash NF4 vs Naive NF4 Correctness Check:
     Max Absolute Error: 1.087785e-05
     Mean Absolute Error: 4.049066e-07
@@ -143,7 +143,7 @@ Cooling down GPU for 1 seconds...
 4. Our Attention (NF4)
 Running dummy run for warm-up...
 Running 100 iterations...
-Median execution time: 0.1372 ms
+Median execution time: 0.1362 ms
   Our NF4 vs Naive NF4 Correctness Check:
     Max Absolute Error: 1.087785e-05
     Mean Absolute Error: 4.049066e-07
@@ -152,25 +152,77 @@ Median execution time: 0.1372 ms
     Status: ✓ PASS (High precision match)
 
 
-========================================================================
-                         PERFORMANCE SUMMARY                            
-========================================================================
-Implementation       | No Quant (ms) | MXFP4 (ms)   | NF4 (ms)    
-------------------------------------------------------------------------
-Naive                |        0.2212 |       0.2488 |       0.2775
-Tiled                |        0.1403 |       0.1884 |       0.1884
-Flash                |        0.1178 |       0.1659 |       0.1659
-Ours                 |           N/A |       0.1260 |       0.1372
-========================================================================
+=== Quantized Weights Tests (NVFP4) ===
 
-========================================================================
-                    SPEEDUP vs Naive (Same Quant)                      
-========================================================================
-Implementation       | No Quant      | MXFP4        | NF4         
-------------------------------------------------------------------------
-Tiled                |         1.58x |        1.32x |        1.47x
-Flash                |         1.88x |        1.50x |        1.67x
-Ours                 |           N/A |        1.98x |        2.02x
-========================================================================
+== Quantizing Weights to NVFP4 ==
+NVFP4 Block size: 16
+Num NVFP4 blocks (Q/K): 3072, Num NVFP4 blocks (V): 3072
+NVFP4 Quantization complete.
+NVFP4 Weight Quantization Error: 1.027644e-01 (10.28%)
+NVFP4 GPU vs CPU Dequantization Error: 0.000000e+00
+Cooling down GPU for 1 seconds...
+
+1. Naive Attention (NVFP4)
+Running dummy run for warm-up...
+Running 100 iterations...
+Median execution time: 0.2478 ms
+Cooling down GPU for 1 seconds...
+
+2. Tiled Attention (NVFP4)
+Running dummy run for warm-up...
+Running 100 iterations...
+Median execution time: 0.1853 ms
+  Tiled NVFP4 vs Naive NVFP4 Correctness Check:
+    Max Absolute Error: 9.536743e-07
+    Mean Absolute Error: 4.036449e-08
+    RMSE: 8.913906e-08
+    Relative Error: 9.716170e-08
+    Status: ✓ PASS (High precision match)
+Cooling down GPU for 1 seconds...
+
+3. Flash-style Attention (NVFP4)
+Running dummy run for warm-up...
+Running 100 iterations...
+Median execution time: 0.1618 ms
+  Flash NVFP4 vs Naive NVFP4 Correctness Check:
+    Max Absolute Error: 1.180172e-05
+    Mean Absolute Error: 4.989612e-07
+    RMSE: 1.070309e-06
+    Relative Error: 1.166639e-06
+    Status: ✓ PASS (High precision match)
+Cooling down GPU for 1 seconds...
+
+4. Our Attention (NVFP4)
+Running dummy run for warm-up...
+Running 100 iterations...
+Median execution time: 0.1741 ms
+  Our NVFP4 vs Naive NVFP4 Correctness Check:
+    Max Absolute Error: 1.180172e-05
+    Mean Absolute Error: 4.989612e-07
+    RMSE: 1.070309e-06
+    Relative Error: 1.166639e-06
+    Status: ✓ PASS (High precision match)
+
+
+======================================================================================
+                                  PERFORMANCE SUMMARY                                 
+======================================================================================
+Implementation       | No Quant (ms) | MXFP4 (ms)   | NF4 (ms)     | NVFP4 (ms)  
+--------------------------------------------------------------------------------------
+Naive                |        0.2171 |       0.2673 |       0.2509 |       0.2478
+Tiled                |        0.1382 |       0.1853 |       0.1853 |       0.1853
+Flash                |        0.1167 |       0.1608 |       0.1618 |       0.1618
+Ours                 |           N/A |       0.1239 |       0.1362 |       0.1741
+======================================================================================
+
+======================================================================================
+                             SPEEDUP vs Naive (Same Quant)                            
+======================================================================================
+Implementation       | No Quant      | MXFP4        | NF4          | NVFP4       
+--------------------------------------------------------------------------------------
+Tiled                |         1.57x |        1.44x |        1.35x |        1.34x
+Flash                |         1.86x |        1.66x |        1.55x |        1.53x
+Ours                 |           N/A |        2.16x |        1.84x |        1.42x
+======================================================================================
 
 === End of Test ===
