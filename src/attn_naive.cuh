@@ -79,4 +79,24 @@ void naive_attention_nf4(
     bool causal_mask = false
 );
 
+void naive_attention_nvfp4(
+    const float* d_X,
+    const void* d_Wq_nvfp4,
+    const void* d_Wk_nvfp4,
+    const void* d_Wv_nvfp4,
+    const NVFP4TensorMeta* d_Wq_meta,
+    const NVFP4TensorMeta* d_Wk_meta,
+    const NVFP4TensorMeta* d_Wv_meta,
+    const float* d_bq,
+    const float* d_bk,
+    const float* d_bv,
+    float* d_output,
+    int batch,
+    int seq_len,
+    int d_model,
+    int d_k,
+    int d_v,
+    bool causal_mask = false
+);
+
 #endif // ATTN_NAIVE_CUH

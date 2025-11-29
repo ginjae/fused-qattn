@@ -659,50 +659,81 @@ inline float nvfp4_mantissa_to_float(uint8_t fp4_val, float scale_e4m3) {
 }
 
 // CPU function to quantize weights to NVFP4 format
+// Implements 2-level scaling from arxiv:2509.25149
 void quantize_nvfp4(
     const float* weights,
     NVFP4Block* quantized_blocks,
+    NVFP4TensorMeta* meta,
     int total_size
 ) {
     int num_blocks = (total_size + NVFP4_BLOCK_SIZE - 1) / NVFP4_BLOCK_SIZE;
     
+    // Step 1: Find global tensor amax
+    float amax_tensor = 0.0f;
+    for (int i = 0; i < total_size; i++) {
+        float abs_val = fabsf(weights[i]);
+        if (abs_val > amax_tensor) amax_tensor = abs_val;
+    }
+    
+    // Step 2: Compute global encode scale (Equation 1 from paper)
+    // s_enc = (6 * 448) / amax_x
+    // where 6 = max E2M1, 448 = max E4M3
+    float s_enc_global = (amax_tensor > 1e-10f) ? ((6.0f * 448.0f) / amax_tensor) : 1.0f;
+    float s_dec_global = 1.0f / s_enc_global;
+    meta->global_scale_dec = s_dec_global;
+    
+    // Step 3: Quantize each block
     for (int b = 0; b < num_blocks; b++) {
         int start = b * NVFP4_BLOCK_SIZE;
         int end = std::min(start + NVFP4_BLOCK_SIZE, total_size);
         
-        // Find the maximum absolute value in this block
-        float max_abs = 0.0f;
+        // Find block amax
+        float amax_block = 0.0f;
         for (int i = start; i < end; i++) {
             float abs_val = fabsf(weights[i]);
-            if (abs_val > max_abs) max_abs = abs_val;
+            if (abs_val > amax_block) amax_block = abs_val;
         }
         
-        // Compute E4M3 scale factor
-        // Target: scale max_abs to fit in FP4 range [0, 6.0]
-        // Scale = max_abs / 6.0, but we want the optimal E4M3 scale
-        // that minimizes quantization error across the block
+        // Compute local decode scale (Equation 2)
+        // s_dec,b = amax_b / 6
+        float s_dec_local = (amax_block > 1e-10f) ? (amax_block / 6.0f) : 1e-10f;
         
-        float target_scale = (max_abs > 1e-10f) ? (max_abs / 6.0f) : 1e-10f;
+        // Quantize local decode scale to E4M3 (Equation 3)
+        // s_dec,b,e4m3 = e4m3(s_dec,b * s_enc)
+        float s_dec_local_prescaled = s_dec_local * s_enc_global;
+        uint8_t s_dec_e4m3 = float_to_fp8_e4m3(s_dec_local_prescaled);
+        quantized_blocks[b].scale_e4m3 = s_dec_e4m3;
         
-        // Quantize scale to E4M3 format
-        uint8_t scale_e4m3_bits = float_to_fp8_e4m3(target_scale);
-        quantized_blocks[b].scale_e4m3 = scale_e4m3_bits;
+        // Compute actual encode scale for this block
+        // s_enc,b = 1 / (fp32(s_dec,b,e4m3) * s_dec)
+        float s_dec_e4m3_fp32 = fp8_e4m3_to_float(s_dec_e4m3);
+        float s_enc_local = 1.0f / (s_dec_e4m3_fp32 * s_dec_global);
         
-        // Dequantize to get actual scale
-        float actual_scale = fp8_e4m3_to_float(scale_e4m3_bits);
-        
-        // Quantize each value in the block
+        // Quantize values in block (Equation 4)
         for (int i = 0; i < NVFP4_BLOCK_SIZE; i++) {
             int idx = start + i;
             float value = (idx < total_size) ? weights[idx] : 0.0f;
             
-            uint8_t nvfp4_val = float_to_nvfp4_mantissa(value, actual_scale);
+            // Apply local encode scale
+            float scaled_value = value * s_enc_local;
+            
+            // Find closest E2M1 value
+            uint8_t best_idx = 0;
+            float min_dist = fabsf(scaled_value - NVFP4_E2M1_TABLE_CPU[0]);
+            
+            for (int j = 1; j < 16; j++) {
+                float dist = fabsf(scaled_value - NVFP4_E2M1_TABLE_CPU[j]);
+                if (dist < min_dist) {
+                    min_dist = dist;
+                    best_idx = j;
+                }
+            }
             
             // Pack 2 values per byte
             if (i % 2 == 0) {
-                quantized_blocks[b].data[i / 2] = nvfp4_val << 4;
+                quantized_blocks[b].data[i / 2] = best_idx << 4;
             } else {
-                quantized_blocks[b].data[i / 2] |= nvfp4_val;
+                quantized_blocks[b].data[i / 2] |= best_idx;
             }
         }
     }
@@ -711,17 +742,23 @@ void quantize_nvfp4(
 // CPU function to dequantize NVFP4 weights back to float
 void dequantize_nvfp4_cpu(
     const NVFP4Block* quantized_blocks,
+    const NVFP4TensorMeta* meta,
     float* weights,
     int total_size
 ) {
     int num_blocks = (total_size + NVFP4_BLOCK_SIZE - 1) / NVFP4_BLOCK_SIZE;
+    float s_dec_global = meta->global_scale_dec;
     
     for (int b = 0; b < num_blocks; b++) {
         int start = b * NVFP4_BLOCK_SIZE;
         int end = std::min(start + NVFP4_BLOCK_SIZE, total_size);
         
-        // Dequantize E4M3 scale
-        float scale_e4m3 = fp8_e4m3_to_float(quantized_blocks[b].scale_e4m3);
+        // Dequantize local E4M3 scale
+        float s_dec_local_e4m3 = fp8_e4m3_to_float(quantized_blocks[b].scale_e4m3);
+        
+        // Apply 2-level scaling (Equation 5)
+        // result = s_dec_local_e4m3 * s_dec_global * E2M1_value
+        float combined_scale = s_dec_local_e4m3 * s_dec_global;
         
         for (int i = 0; i < NVFP4_BLOCK_SIZE && (start + i) < total_size; i++) {
             // Unpack 4-bit value
@@ -732,7 +769,8 @@ void dequantize_nvfp4_cpu(
                 nvfp4_val = quantized_blocks[b].data[i / 2] & 0xF;
             }
             
-            weights[start + i] = nvfp4_mantissa_to_float(nvfp4_val, scale_e4m3);
+            if (nvfp4_val >= 16) nvfp4_val = 15;
+            weights[start + i] = NVFP4_E2M1_TABLE_CPU[nvfp4_val] * combined_scale;
         }
     }
 }
@@ -742,11 +780,13 @@ void dequantize_nvfp4_cpu(
 // ============================================================================
 
 // GPU Kernel for NVFP4 Dequantization
-// Dequantizes NVFP4 weights to float
+// Dequantizes NVFP4 weights to float using 2-level scaling
 // W_quantized: [num_blocks] NVFP4 blocks
 // W_dequantized: [total_size] output float values
+// s_dec_global: per-tensor FP32 scale
 __global__ void dequantize_nvfp4_kernel(
     const NVFP4Block* W_quantized,
+    float s_dec_global,
     float* W_dequantized,
     int total_size
 ) {
@@ -756,7 +796,11 @@ __global__ void dequantize_nvfp4_kernel(
         int block_idx = idx / NVFP4_BLOCK_SIZE;
         int local_idx = idx % NVFP4_BLOCK_SIZE;
         
-        float scale_e4m3 = fp8_e4m3_to_float(W_quantized[block_idx].scale_e4m3);
+        // Dequantize local E4M3 scale
+        float s_dec_local_e4m3 = fp8_e4m3_to_float(W_quantized[block_idx].scale_e4m3);
+        
+        // Apply 2-level scaling (Equation 5 from paper)
+        float combined_scale = s_dec_local_e4m3 * s_dec_global;
         
         // Unpack 4-bit value
         uint8_t nvfp4_val;
@@ -766,9 +810,9 @@ __global__ void dequantize_nvfp4_kernel(
             nvfp4_val = W_quantized[block_idx].data[local_idx / 2] & 0xF;
         }
         
-        // Dequantize using lookup table: x = x_q × scale
+        // Dequantize using lookup table with 2-level scale
         if (nvfp4_val >= 16) nvfp4_val = 15;
-        W_dequantized[idx] = NVFP4_E2M1_TABLE_GPU[nvfp4_val] * scale_e4m3;
+        W_dequantized[idx] = NVFP4_E2M1_TABLE_GPU[nvfp4_val] * combined_scale;
     }
 }
 
@@ -1428,15 +1472,19 @@ __global__ void fused_mxfp4_qkv_projection_kernel(
 // ============================================================================
 
 // Kernel: Fused NVFP4 Dequantization + QKV Projection
-// Performs on-the-fly NVFP4 dequantization during matrix multiplication
+// Performs on-the-fly NVFP4 dequantization with 2-level scaling
 // X: [batch, seq_len, d_model]
 // Wq_quantized, Wk_quantized, Wv_quantized: NVFP4Block arrays
+// s_dec_global_q/k/v: per-tensor FP32 decode scales
 // Q, K, V: [batch, seq_len, d_k/d_v]
 __global__ void fused_nvfp4_qkv_projection_kernel(
     const float* __restrict__ X,
     const NVFP4Block* __restrict__ Wq_quantized,
     const NVFP4Block* __restrict__ Wk_quantized,
     const NVFP4Block* __restrict__ Wv_quantized,
+    float s_dec_global_q,
+    float s_dec_global_k,
+    float s_dec_global_v,
     const float* __restrict__ bq,
     const float* __restrict__ bk,
     const float* __restrict__ bv,
@@ -1479,13 +1527,15 @@ __global__ void fused_nvfp4_qkv_projection_kernel(
         const int w_col = col;
 
         // 2. Load and dequantize ALL weight tiles in parallel
-        // Dequantize Wq from NVFP4
+        // Dequantize Wq from NVFP4 with 2-level scaling
         if (w_row < d_model && w_col < d_k) {
             const int wq_idx = w_row * d_k + w_col;
             const int block_idx = wq_idx / NVFP4_BLOCK_SIZE;
             const int local_idx = wq_idx % NVFP4_BLOCK_SIZE;
             
-            const float scale_e4m3 = fp8_e4m3_to_float(Wq_quantized[block_idx].scale_e4m3);
+            // Get local E4M3 scale and apply 2-level scaling
+            const float s_dec_local_e4m3 = fp8_e4m3_to_float(Wq_quantized[block_idx].scale_e4m3);
+            const float combined_scale = s_dec_local_e4m3 * s_dec_global_q;
             
             // Unpack 4-bit value
             uint8_t nvfp4_val;
@@ -1496,14 +1546,15 @@ __global__ void fused_nvfp4_qkv_projection_kernel(
             }
             
             if (nvfp4_val >= 16) nvfp4_val = 15;
-            Wq_tile[threadIdx.y][threadIdx.x] = NVFP4_E2M1_TABLE_GPU[nvfp4_val] * scale_e4m3;
+            Wq_tile[threadIdx.y][threadIdx.x] = NVFP4_E2M1_TABLE_GPU[nvfp4_val] * combined_scale;
 
-            // Dequantize Wk from NVFP4
+            // Dequantize Wk from NVFP4 with 2-level scaling
             const int wk_idx = w_row * d_k + w_col;
             const int block_idx_k = wk_idx / NVFP4_BLOCK_SIZE;
             const int local_idx_k = wk_idx % NVFP4_BLOCK_SIZE;
             
-            const float scale_e4m3_k = fp8_e4m3_to_float(Wk_quantized[block_idx_k].scale_e4m3);
+            const float s_dec_local_e4m3_k = fp8_e4m3_to_float(Wk_quantized[block_idx_k].scale_e4m3);
+            const float combined_scale_k = s_dec_local_e4m3_k * s_dec_global_k;
             
             uint8_t nvfp4_val_k;
             if (local_idx_k % 2 == 0) {
@@ -1513,19 +1564,20 @@ __global__ void fused_nvfp4_qkv_projection_kernel(
             }
             
             if (nvfp4_val_k >= 16) nvfp4_val_k = 15;
-            Wk_tile[threadIdx.y][threadIdx.x] = NVFP4_E2M1_TABLE_GPU[nvfp4_val_k] * scale_e4m3_k;
+            Wk_tile[threadIdx.y][threadIdx.x] = NVFP4_E2M1_TABLE_GPU[nvfp4_val_k] * combined_scale_k;
         } else {
             Wq_tile[threadIdx.y][threadIdx.x] = 0.0f;
             Wk_tile[threadIdx.y][threadIdx.x] = 0.0f;
         }
 
-        // Dequantize Wv from NVFP4
+        // Dequantize Wv from NVFP4 with 2-level scaling
         if (w_row < d_model && w_col < d_v) {
             const int wv_idx = w_row * d_v + w_col;
             const int block_idx_v = wv_idx / NVFP4_BLOCK_SIZE;
             const int local_idx_v = wv_idx % NVFP4_BLOCK_SIZE;
             
-            const float scale_e4m3_v = fp8_e4m3_to_float(Wv_quantized[block_idx_v].scale_e4m3);
+            const float s_dec_local_e4m3_v = fp8_e4m3_to_float(Wv_quantized[block_idx_v].scale_e4m3);
+            const float combined_scale_v = s_dec_local_e4m3_v * s_dec_global_v;
             
             uint8_t nvfp4_val_v;
             if (local_idx_v % 2 == 0) {
@@ -1535,7 +1587,7 @@ __global__ void fused_nvfp4_qkv_projection_kernel(
             }
             
             if (nvfp4_val_v >= 16) nvfp4_val_v = 15;
-            Wv_tile[threadIdx.y][threadIdx.x] = NVFP4_E2M1_TABLE_GPU[nvfp4_val_v] * scale_e4m3_v;
+            Wv_tile[threadIdx.y][threadIdx.x] = NVFP4_E2M1_TABLE_GPU[nvfp4_val_v] * combined_scale_v;
         } else {
             Wv_tile[threadIdx.y][threadIdx.x] = 0.0f;
         }

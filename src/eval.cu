@@ -281,6 +281,7 @@ int main() {
     float* h_naive_baseline_int8 = (float*)malloc(out_size);    // Naive INT8 baseline (for INT8 section)
     float* h_naive_baseline_mxfp4 = (float*)malloc(out_size);   // Naive MXFP4 baseline (for MXFP4 section)
     float* h_naive_baseline_nf4 = (float*)malloc(out_size);     // Naive NF4 baseline (for NF4 section)
+    float* h_naive_baseline_nvfp4 = (float*)malloc(out_size);   // Naive NVFP4 baseline (for NVFP4 section)
     float* h_result_temp = (float*)malloc(out_size);            // Temporary buffer for current test result
 
     // Create CUDA events for timing
@@ -294,6 +295,8 @@ int main() {
     float time_unquant_naive = 0.0f, time_unquant_tiled = 0.0f, time_unquant_flash = 0.0f;
     float time_mxfp4_naive = 0.0f, time_mxfp4_tiled = 0.0f, time_mxfp4_flash = 0.0f, time_mxfp4_ours = 0.0f;
     float time_nf4_naive = 0.0f, time_nf4_tiled = 0.0f, time_nf4_flash = 0.0f, time_nf4_ours = 0.0f;
+    float time_nvfp4_naive = 0.0f, time_nvfp4_tiled = 0.0f, time_nvfp4_flash = 0.0f, time_nvfp4_ours = 0.0f;
+
 
     cooldown_gpu(COOLDOWN_SECONDS);
     // Test 1: Naive attention with original (unquantized) weights - BASELINE
@@ -325,7 +328,6 @@ int main() {
     // print_output_sample("Output (Unquantized)", h_baseline_unquantized, seq_len, d_v);
     time_unquant_naive = elapsed_time_unquant;
     printf("Median execution time: %.4f ms\n", elapsed_time_unquant);
-
 
     cooldown_gpu(COOLDOWN_SECONDS);
     // Test 2: Tiled attention with original (unquantized) weights
@@ -360,7 +362,6 @@ int main() {
     // Compare with baseline
     compute_error_metrics("Tiled vs Naive", h_baseline_unquantized, h_result_temp, 
                          batch, seq_len, d_v, UNQUANTIZED);
-
 
     cooldown_gpu(COOLDOWN_SECONDS);
     // Test 3: Flash-style attention with original (unquantized) weights
@@ -544,7 +545,6 @@ int main() {
     // compute_error_metrics("Tiled Quantized vs Naive Quantized", h_naive_baseline_int8, h_result_temp, 
     //                      batch, seq_len, d_v, UNQUANTIZED);
 
-
     // cooldown_gpu(COOLDOWN_SECONDS);
     // printf("\n3. Flash-style Attention (Quantized)\n");
     // // Dummy run to warm up GPU
@@ -585,7 +585,6 @@ int main() {
     // // Compare with baseline (both INT8, should match closely)
     // compute_error_metrics("Flash Quantized vs Naive Quantized", h_naive_baseline_int8, h_result_temp, 
     //                      batch, seq_len, d_v, UNQUANTIZED);
-
 
     // cooldown_gpu(COOLDOWN_SECONDS);
     // printf("\n4. Our Attention (Quantized)\n");
@@ -736,7 +735,6 @@ int main() {
     
     // Copy result back as MXFP4 baseline
     CUDA_CHECK(cudaMemcpy(h_naive_baseline_mxfp4, d_output, out_size, cudaMemcpyDeviceToHost));
-
 
     cooldown_gpu(COOLDOWN_SECONDS);
     printf("\n2. Tiled Attention (MXFP4)\n");
@@ -953,7 +951,6 @@ int main() {
     // Copy result back as NF4 baseline
     CUDA_CHECK(cudaMemcpy(h_naive_baseline_nf4, d_output, out_size, cudaMemcpyDeviceToHost));
 
-
     cooldown_gpu(COOLDOWN_SECONDS);
     printf("\n2. Tiled Attention (NF4)\n");
     // Dummy run to warm up GPU
@@ -1052,7 +1049,7 @@ int main() {
     }
     elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
 
-    // Copy MXFP4 result back
+    // Copy NF4 result back
     CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
 
     time_nf4_ours = elapsed_time_quant;
@@ -1074,9 +1071,12 @@ int main() {
     NVFP4Block* h_Wq_nvfp4 = (NVFP4Block*)malloc(num_blocks_q_nvfp4 * sizeof(NVFP4Block));
     NVFP4Block* h_Wk_nvfp4 = (NVFP4Block*)malloc(num_blocks_q_nvfp4 * sizeof(NVFP4Block));
     NVFP4Block* h_Wv_nvfp4 = (NVFP4Block*)malloc(num_blocks_v_nvfp4 * sizeof(NVFP4Block));
-    quantize_nvfp4(h_Wq, h_Wq_nvfp4, d_model * d_k);
-    quantize_nvfp4(h_Wk, h_Wk_nvfp4, d_model * d_k);
-    quantize_nvfp4(h_Wv, h_Wv_nvfp4, d_model * d_v);
+    
+    NVFP4TensorMeta h_Wq_nvfp4_meta, h_Wk_nvfp4_meta, h_Wv_nvfp4_meta;
+    
+    quantize_nvfp4(h_Wq, h_Wq_nvfp4, &h_Wq_nvfp4_meta, d_model * d_k);
+    quantize_nvfp4(h_Wk, h_Wk_nvfp4, &h_Wk_nvfp4_meta, d_model * d_k);
+    quantize_nvfp4(h_Wv, h_Wv_nvfp4, &h_Wv_nvfp4_meta, d_model * d_v);
 
     printf("NVFP4 Block size: %d\n", NVFP4_BLOCK_SIZE);
     printf("Num NVFP4 blocks (Q/K): %d, Num NVFP4 blocks (V): %d\n", num_blocks_q_nvfp4, num_blocks_v_nvfp4);
@@ -1084,7 +1084,7 @@ int main() {
     
     // Test NVFP4 quantization accuracy
     h_Wq_dequant_test = (float*)malloc(wq_size);
-    dequantize_nvfp4_cpu(h_Wq_nvfp4, h_Wq_dequant_test, d_model * d_k);
+    dequantize_nvfp4_cpu(h_Wq_nvfp4, &h_Wq_nvfp4_meta, h_Wq_dequant_test, d_model * d_k);
     double nvfp4_test_error = 0.0;
     double nvfp4_test_sum_sq = 0.0;
     for (int i = 0; i < d_model * d_k; i++) {
@@ -1096,44 +1096,231 @@ int main() {
     printf("NVFP4 Weight Quantization Error: %.6e (%.2f%%)\n", nvfp4_relative_error, nvfp4_relative_error * 100);
     free(h_Wq_dequant_test);
 
+    // Allocate device memory for NVFP4 quantized weights
+    NVFP4Block *d_Wq_nvfp4, *d_Wk_nvfp4, *d_Wv_nvfp4;
+
+    CUDA_CHECK(cudaMalloc(&d_Wq_nvfp4, num_blocks_q_nvfp4 * sizeof(NVFP4Block)));
+    CUDA_CHECK(cudaMalloc(&d_Wk_nvfp4, num_blocks_q_nvfp4 * sizeof(NVFP4Block)));
+    CUDA_CHECK(cudaMalloc(&d_Wv_nvfp4, num_blocks_v_nvfp4 * sizeof(NVFP4Block)));
+
+    // Copy NVFP4 quantized data to device
+    CUDA_CHECK(cudaMemcpy(d_Wq_nvfp4, h_Wq_nvfp4, num_blocks_q_nvfp4 * sizeof(NVFP4Block), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_Wk_nvfp4, h_Wk_nvfp4, num_blocks_q_nvfp4 * sizeof(NVFP4Block), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_Wv_nvfp4, h_Wv_nvfp4, num_blocks_v_nvfp4 * sizeof(NVFP4Block), cudaMemcpyHostToDevice));
+
+    // Test GPU dequantization matches CPU
+    d_Wq_test_dequant = NULL;
+    h_Wq_gpu_dequant = (float*)malloc(wq_size);
+    CUDA_CHECK(cudaMalloc(&d_Wq_test_dequant, wq_size));
+    
+    grid_test = dim3((d_model * d_k + block_test.x - 1) / block_test.x);
+    dequantize_nvfp4_kernel<<<grid_test, block_test>>>(d_Wq_nvfp4, h_Wq_nvfp4_meta.global_scale_dec, d_Wq_test_dequant, d_model * d_k);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpy(h_Wq_gpu_dequant, d_Wq_test_dequant, wq_size, cudaMemcpyDeviceToHost));
+    
+    gpu_cpu_diff = 0.0;
+    for (int i = 0; i < d_model * d_k; i++) {
+        double diff = h_Wq_dequant_test[i] - h_Wq_gpu_dequant[i];
+        gpu_cpu_diff += diff * diff;
+    }
+    printf("NVFP4 GPU vs CPU Dequantization Error: %.6e\n", sqrt(gpu_cpu_diff / (d_model * d_k)));
+    
+    CUDA_CHECK(cudaFree(d_Wq_test_dequant));
+    free(h_Wq_gpu_dequant);
 
 
+    cooldown_gpu(COOLDOWN_SECONDS);
+    printf("\n1. Naive Attention (NVFP4)\n");
+    // Dummy run to warm up GPU
+    printf("Running dummy run for warm-up...\n");
+    naive_attention_nvfp4(d_X,
+                          d_Wq_nvfp4, d_Wk_nvfp4, d_Wv_nvfp4,
+                          &h_Wq_nvfp4_meta, &h_Wk_nvfp4_meta, &h_Wv_nvfp4_meta,
+                          d_bq, d_bk, d_bv,
+                          d_output, batch, seq_len, d_model, d_k, d_v,
+                          false);
+    CUDA_CHECK(cudaDeviceSynchronize());
 
+    // Run multiple iterations
+    printf("Running %d iterations...\n", NUM_ITERATIONS);
+    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
+        CUDA_CHECK(cudaEventRecord(start));
+        naive_attention_nvfp4(d_X, 
+                              d_Wq_nvfp4, d_Wk_nvfp4, d_Wv_nvfp4,
+                              &h_Wq_nvfp4_meta, &h_Wk_nvfp4_meta, &h_Wv_nvfp4_meta,
+                              d_bq, d_bk, d_bv,
+                              d_output, batch, seq_len, d_model, d_k, d_v,
+                              false);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
+    }
+    elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
+
+    // Copy NVFP4 result back
+    CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
+
+    time_nvfp4_naive = elapsed_time_quant;
+    printf("Median execution time: %.4f ms\n", elapsed_time_quant);
+    
+    // // Compare with unquantized baseline (using 4-bit quantized thresholds)
+    // compute_error_metrics("Naive NVFP4 vs Naive Baseline", h_baseline_unquantized, h_result_temp, 
+    //                      batch, seq_len, d_v, FP4_QUANT);
+    
+    // Copy result back as NVFP4 baseline
+    CUDA_CHECK(cudaMemcpy(h_naive_baseline_nvfp4, d_output, out_size, cudaMemcpyDeviceToHost));
+
+    cooldown_gpu(COOLDOWN_SECONDS);
+    printf("\n2. Tiled Attention (NVFP4)\n");
+    // Dummy run to warm up GPU
+    printf("Running dummy run for warm-up...\n");
+    tiled_attention_nvfp4(d_X, 
+                          d_Wq_nvfp4, d_Wk_nvfp4, d_Wv_nvfp4,
+                          &h_Wq_nvfp4_meta, &h_Wk_nvfp4_meta, &h_Wv_nvfp4_meta,
+                          d_bq, d_bk, d_bv,
+                          d_output, batch, seq_len, d_model, d_k, d_v,
+                          false);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Run multiple iterations
+    printf("Running %d iterations...\n", NUM_ITERATIONS);
+    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
+        CUDA_CHECK(cudaEventRecord(start));
+        tiled_attention_nvfp4(d_X, 
+                              d_Wq_nvfp4, d_Wk_nvfp4, d_Wv_nvfp4,
+                              &h_Wq_nvfp4_meta, &h_Wk_nvfp4_meta, &h_Wv_nvfp4_meta,
+                              d_bq, d_bk, d_bv,
+                              d_output, batch, seq_len, d_model, d_k, d_v,
+                              false);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
+    }
+    elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
+
+    // Copy NVFP4 result back
+    CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
+
+    time_nvfp4_tiled = elapsed_time_quant;
+    printf("Median execution time: %.4f ms\n", elapsed_time_quant);
+    
+    // Compare with baseline (both NVFP4, should match closely)
+    compute_error_metrics("Tiled NVFP4 vs Naive NVFP4", h_naive_baseline_nvfp4, h_result_temp, 
+                         batch, seq_len, d_v, UNQUANTIZED);
+
+    cooldown_gpu(COOLDOWN_SECONDS);
+    printf("\n3. Flash-style Attention (NVFP4)\n");
+    // Dummy run to warm up GPU
+    printf("Running dummy run for warm-up...\n");
+    flash_attention_nvfp4(d_X, 
+                          d_Wq_nvfp4, d_Wk_nvfp4, d_Wv_nvfp4,
+                          &h_Wq_nvfp4_meta, &h_Wk_nvfp4_meta, &h_Wv_nvfp4_meta,
+                          d_bq, d_bk, d_bv,
+                          d_output, batch, seq_len, d_model, d_k, d_v,
+                          false);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Run multiple iterations
+    printf("Running %d iterations...\n", NUM_ITERATIONS);
+    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
+        CUDA_CHECK(cudaEventRecord(start));
+        flash_attention_nvfp4(d_X, 
+                              d_Wq_nvfp4, d_Wk_nvfp4, d_Wv_nvfp4,
+                              &h_Wq_nvfp4_meta, &h_Wk_nvfp4_meta, &h_Wv_nvfp4_meta,
+                              d_bq, d_bk, d_bv,
+                              d_output, batch, seq_len, d_model, d_k, d_v,
+                              false);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
+    }
+    elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
+
+    // Copy NVFP4 result back
+    CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
+
+    time_nvfp4_flash = elapsed_time_quant;
+    printf("Median execution time: %.4f ms\n", elapsed_time_quant);
+    
+    // Compare with baseline (both NVFP4, should match closely)
+    compute_error_metrics("Flash NVFP4 vs Naive NVFP4", h_naive_baseline_nvfp4, h_result_temp, 
+                         batch, seq_len, d_v, UNQUANTIZED);
+
+    cooldown_gpu(COOLDOWN_SECONDS);
+    printf("\n4. Our Attention (NVFP4)\n");
+
+    printf("Running dummy run for warm-up...\n");
+    our_attention_nvfp4(d_X, 
+                        d_Wq_nvfp4, d_Wk_nvfp4, d_Wv_nvfp4,
+                        &h_Wq_nvfp4_meta, &h_Wk_nvfp4_meta, &h_Wv_nvfp4_meta,
+                        d_bq, d_bk, d_bv,
+                        d_output, batch, seq_len, d_model, d_k, d_v,
+                        false);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Run multiple iterations
+    printf("Running %d iterations...\n", NUM_ITERATIONS);
+    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
+        CUDA_CHECK(cudaEventRecord(start));
+        our_attention_nvfp4(d_X, 
+                            d_Wq_nvfp4, d_Wk_nvfp4, d_Wv_nvfp4,
+                            &h_Wq_nvfp4_meta, &h_Wk_nvfp4_meta, &h_Wv_nvfp4_meta,
+                            d_bq, d_bk, d_bv,
+                            d_output, batch, seq_len, d_model, d_k, d_v,
+                            false);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
+    }
+    elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
+
+    // Copy NVFP4 result back
+    CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
+
+    time_nvfp4_ours = elapsed_time_quant;
+    printf("Median execution time: %.4f ms\n", elapsed_time_quant);
+    
+    // Compare with baseline (both NVFP4, should match closely)
+    compute_error_metrics("Our NVFP4 vs Naive NVFP4", h_naive_baseline_nvfp4, h_result_temp, 
+                         batch, seq_len, d_v, UNQUANTIZED);
 
 
     // Print summary table
     printf("\n\n");
-    printf("========================================================================\n");
-    printf("                         PERFORMANCE SUMMARY                            \n");
-    printf("========================================================================\n");
-    printf("%-20s | %-12s | %-12s | %-12s\n", "Implementation", "No Quant (ms)", "MXFP4 (ms)", "NF4 (ms)");
-    printf("------------------------------------------------------------------------\n");
-    printf("%-20s | %13.4f | %12.4f | %12.4f\n", "Naive", time_unquant_naive, time_mxfp4_naive, time_nf4_naive);
-    printf("%-20s | %13.4f | %12.4f | %12.4f\n", "Tiled", time_unquant_tiled, time_mxfp4_tiled, time_nf4_tiled);
-    printf("%-20s | %13.4f | %12.4f | %12.4f\n", "Flash", time_unquant_flash, time_mxfp4_flash, time_nf4_flash);
-    printf("%-20s | %13s | %12.4f | %12.4f\n", "Ours", "N/A", time_mxfp4_ours, time_nf4_ours);
-    printf("========================================================================\n");
+    printf("======================================================================================\n");
+    printf("                                  PERFORMANCE SUMMARY                                 \n");
+    printf("======================================================================================\n");
+    printf("%-20s | %-12s | %-12s | %-12s | %-12s\n", "Implementation", "No Quant (ms)", "MXFP4 (ms)", "NF4 (ms)", "NVFP4 (ms)");
+    printf("--------------------------------------------------------------------------------------\n");
+    printf("%-20s | %13.4f | %12.4f | %12.4f | %12.4f\n", "Naive", time_unquant_naive, time_mxfp4_naive, time_nf4_naive, time_nvfp4_naive);
+    printf("%-20s | %13.4f | %12.4f | %12.4f | %12.4f\n", "Tiled", time_unquant_tiled, time_mxfp4_tiled, time_nf4_tiled, time_nvfp4_tiled);
+    printf("%-20s | %13.4f | %12.4f | %12.4f | %12.4f\n", "Flash", time_unquant_flash, time_mxfp4_flash, time_nf4_flash, time_nvfp4_flash);
+    printf("%-20s | %13s | %12.4f | %12.4f | %12.4f\n", "Ours", "N/A", time_mxfp4_ours, time_nf4_ours, time_nvfp4_ours);
+    printf("======================================================================================\n");
     
     // Calculate and display speedups
     printf("\n");
-    printf("========================================================================\n");
-    printf("                    SPEEDUP vs Naive (Same Quant)                      \n");
-    printf("========================================================================\n");
-    printf("%-20s | %-13s | %-12s | %-12s\n", "Implementation", "No Quant", "MXFP4", "NF4");
-    printf("------------------------------------------------------------------------\n");
-    printf("%-20s | %12.2fx | %11.2fx | %11.2fx\n", "Tiled", 
+    printf("======================================================================================\n");
+    printf("                             SPEEDUP vs Naive (Same Quant)                            \n");
+    printf("======================================================================================\n");
+    printf("%-20s | %-13s | %-12s | %-12s | %-12s\n", "Implementation", "No Quant", "MXFP4", "NF4", "NVFP4");
+    printf("--------------------------------------------------------------------------------------\n");
+    printf("%-20s | %12.2fx | %11.2fx | %11.2fx | %11.2fx\n", "Tiled", 
            time_unquant_naive/time_unquant_tiled, 
            time_mxfp4_naive/time_mxfp4_tiled, 
-           time_nf4_naive/time_nf4_tiled);
-    printf("%-20s | %12.2fx | %11.2fx | %11.2fx\n", "Flash", 
+           time_nf4_naive/time_nf4_tiled,
+           time_nvfp4_naive/time_nvfp4_tiled);
+    printf("%-20s | %12.2fx | %11.2fx | %11.2fx | %11.2fx\n", "Flash", 
            time_unquant_naive/time_unquant_flash, 
            time_mxfp4_naive/time_mxfp4_flash, 
-           time_nf4_naive/time_nf4_flash);
-    printf("%-20s | %13s | %11.2fx | %11.2fx\n", "Ours", 
+           time_nf4_naive/time_nf4_flash,
+           time_nvfp4_naive/time_nvfp4_flash);
+    printf("%-20s | %13s | %11.2fx | %11.2fx | %11.2fx\n", "Ours", 
            "N/A", 
            time_mxfp4_naive/time_mxfp4_ours, 
-           time_nf4_naive/time_nf4_ours);
-    printf("========================================================================\n");
+           time_nf4_naive/time_nf4_ours,
+           time_nvfp4_naive/time_nvfp4_ours);
+    printf("======================================================================================\n");
     printf("\n");
 
 
@@ -1154,6 +1341,8 @@ int main() {
     free(h_baseline_unquantized);
     free(h_naive_baseline_int8);
     free(h_naive_baseline_mxfp4);
+    free(h_naive_baseline_nf4);
+    free(h_naive_baseline_nvfp4);
     free(h_result_temp);
     // free(h_Wq_quant);
     // free(h_Wk_quant);
@@ -1170,6 +1359,9 @@ int main() {
     free(h_Wq_nf4);
     free(h_Wk_nf4);
     free(h_Wv_nf4);
+    free(h_Wq_nvfp4);
+    free(h_Wk_nvfp4);
+    free(h_Wv_nvfp4);
 
     CUDA_CHECK(cudaFree(d_X));
     CUDA_CHECK(cudaFree(d_Wq));
@@ -1194,6 +1386,9 @@ int main() {
     CUDA_CHECK(cudaFree(d_Wq_nf4));
     CUDA_CHECK(cudaFree(d_Wk_nf4));
     CUDA_CHECK(cudaFree(d_Wv_nf4));
+    CUDA_CHECK(cudaFree(d_Wq_nvfp4));
+    CUDA_CHECK(cudaFree(d_Wk_nvfp4));
+    CUDA_CHECK(cudaFree(d_Wv_nvfp4));
 
     printf("=== End of Test ===\n");
 

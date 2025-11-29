@@ -418,3 +418,63 @@ void our_attention_nf4(
     CUDA_CHECK(cudaFree(d_V));
     CUDA_CHECK(cudaDeviceSynchronize());
 }
+
+void our_attention_nvfp4(
+    const float* d_X,
+    const void* d_Wq_nvfp4,
+    const void* d_Wk_nvfp4,
+    const void* d_Wv_nvfp4,
+    const NVFP4TensorMeta* d_Wq_meta,
+    const NVFP4TensorMeta* d_Wk_meta,
+    const NVFP4TensorMeta* d_Wv_meta,
+    const float* d_bq,
+    const float* d_bk,
+    const float* d_bv,
+    float* d_output,
+    int batch,
+    int seq_len,
+    int d_model,
+    int d_k,
+    int d_v,
+    bool causal_mask = false
+) {
+    const NVFP4Block* Wq_blocks = static_cast<const NVFP4Block*>(d_Wq_nvfp4);
+    const NVFP4Block* Wk_blocks = static_cast<const NVFP4Block*>(d_Wk_nvfp4);
+    const NVFP4Block* Wv_blocks = static_cast<const NVFP4Block*>(d_Wv_nvfp4);
+
+    // Allocate temporary buffers for Q, K, V (not dequantized weights!)
+    float *d_Q, *d_K, *d_V;
+    CUDA_CHECK(cudaMalloc(&d_Q, batch * seq_len * d_k * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_K, batch * seq_len * d_k * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_V, batch * seq_len * d_v * sizeof(float)));
+
+    // Fused NF4 Dequantization + QKV projection kernel
+    int max_d = (d_k > d_v) ? d_k : d_v;
+    dim3 block_fused(TILE_SIZE, TILE_SIZE);
+    dim3 grid_fused((max_d + TILE_SIZE - 1) / TILE_SIZE,
+                    (seq_len + TILE_SIZE - 1) / TILE_SIZE,
+                    batch);
+    fused_nvfp4_qkv_projection_kernel<<<grid_fused, block_fused>>>(
+        d_X, Wq_blocks, Wk_blocks, Wv_blocks,
+        d_Wq_meta->global_scale_dec, d_Wk_meta->global_scale_dec, d_Wv_meta->global_scale_dec,
+        d_bq, d_bk, d_bv,
+        d_Q, d_K, d_V,
+        batch, seq_len, d_model, d_k, d_v);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Step 1 & 2 & 3 & 4 (FUSED): Q·Kᵀ MatMul + Scaling + Masking + Online Softmax + A·V MatMul
+    dim3 block_fused_qk(256);  // One block per row with 256 threads
+    dim3 grid_fused_qk(seq_len, batch);
+    const float scale_factor = rsqrtf((float)d_k);
+    size_t shared_bytes = seq_len * sizeof(float);
+
+    our_attention_kernel<<<grid_fused_qk, block_fused_qk, shared_bytes>>>(
+        d_Q, d_K, d_V, d_output, batch, seq_len, d_k, d_v, scale_factor, causal_mask);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Free temporary buffers
+    CUDA_CHECK(cudaFree(d_Q));
+    CUDA_CHECK(cudaFree(d_K));
+    CUDA_CHECK(cudaFree(d_V));
+    CUDA_CHECK(cudaDeviceSynchronize());
+}

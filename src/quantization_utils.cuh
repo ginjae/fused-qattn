@@ -28,11 +28,16 @@ struct MXFP4Block {
 };
 
 // NVFP4 quantized data structure (NVIDIA Blackwell format)
-// Each block has one E4M3 FP8 scale and contains NVFP4_BLOCK_SIZE 4-bit mantissas
-// Uses finer-grained 16-value blocks for better accuracy
+// Uses 2-level scaling: FP32 per-tensor + E4M3 per-block (16 elements)
+// Based on arxiv:2509.25149 specification
 struct NVFP4Block {
-    uint8_t scale_e4m3;     // FP8 E4M3 scale factor for the block
+    uint8_t scale_e4m3;     // FP8 E4M3 local decode scale for the block
     uint8_t data[8];        // Packed 4-bit values (2 values per byte, for 16 values)
+};
+
+// NVFP4 Tensor metadata (stores per-tensor scale)
+struct NVFP4TensorMeta {
+    float global_scale_dec; // FP32 global decode scale (inverse of encode scale)
 };
 
 // NF4 quantized data structure
@@ -80,15 +85,18 @@ void dequantize_mxfp4_cpu(
 
 // NVFP4 Quantization Functions
 // Quantize weights to NVFP4 format (CPU version)
+// Returns per-tensor metadata in meta parameter
 void quantize_nvfp4(
     const float* weights,
     NVFP4Block* quantized_blocks,
+    NVFP4TensorMeta* meta,
     int total_size
 );
 
 // Dequantize NVFP4 weights back to float (CPU version)
 void dequantize_nvfp4_cpu(
     const NVFP4Block* quantized_blocks,
+    const NVFP4TensorMeta* meta,
     float* weights,
     int total_size
 );
@@ -113,6 +121,7 @@ __global__ void dequantize_mxfp4_kernel(
 // NVFP4 GPU dequantization kernel
 __global__ void dequantize_nvfp4_kernel(
     const NVFP4Block* W_quantized,
+    float s_dec_global,
     float* W_dequantized,
     int total_size
 );
@@ -248,6 +257,9 @@ __global__ void fused_nvfp4_qkv_projection_kernel(
     const NVFP4Block* __restrict__ Wq_quantized,
     const NVFP4Block* __restrict__ Wk_quantized,
     const NVFP4Block* __restrict__ Wv_quantized,
+    float s_dec_global_q,
+    float s_dec_global_k,
+    float s_dec_global_v,
     const float* __restrict__ bq,
     const float* __restrict__ bk,
     const float* __restrict__ bv,

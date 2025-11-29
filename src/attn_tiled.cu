@@ -659,3 +659,122 @@ void tiled_attention_nf4(
     CUDA_CHECK(cudaFree(d_Wv));
     CUDA_CHECK(cudaDeviceSynchronize());
 }
+
+// Host function to perform naive attention with NVFP4 quantized weight matrices
+void tiled_attention_nvfp4(
+    const float* d_X,
+    const void* d_Wq_nvfp4,
+    const void* d_Wk_nvfp4,
+    const void* d_Wv_nvfp4,
+    const NVFP4TensorMeta* d_Wq_meta,
+    const NVFP4TensorMeta* d_Wk_meta,
+    const NVFP4TensorMeta* d_Wv_meta,
+    const float* d_bq,
+    const float* d_bk,
+    const float* d_bv,
+    float* d_output,
+    int batch,
+    int seq_len,
+    int d_model,
+    int d_k,
+    int d_v,
+    bool causal_mask = false
+) {
+    const NVFP4Block* Wq_blocks = static_cast<const NVFP4Block*>(d_Wq_nvfp4);
+    const NVFP4Block* Wk_blocks = static_cast<const NVFP4Block*>(d_Wk_nvfp4);
+    const NVFP4Block* Wv_blocks = static_cast<const NVFP4Block*>(d_Wv_nvfp4);
+
+    // Allocate temporary buffers for dequantized weights
+    float *d_Wq, *d_Wk, *d_Wv;
+    CUDA_CHECK(cudaMalloc(&d_Wq, d_model * d_k * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_Wk, d_model * d_k * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_Wv, d_model * d_v * sizeof(float)));
+
+    // Dequantize NF4 weights
+    int total_size_q = d_model * d_k;
+    int total_size_v = d_model * d_v;
+    
+    dim3 block_dequant(256);
+    dim3 grid_wq((total_size_q + block_dequant.x - 1) / block_dequant.x);
+    dim3 grid_wk((total_size_q + block_dequant.x - 1) / block_dequant.x);
+    dim3 grid_wv((total_size_v + block_dequant.x - 1) / block_dequant.x);
+
+    dequantize_nvfp4_kernel<<<grid_wq, block_dequant>>>(Wq_blocks, d_Wq_meta->global_scale_dec, d_Wq, total_size_q);
+    CUDA_CHECK(cudaGetLastError());
+
+    dequantize_nvfp4_kernel<<<grid_wk, block_dequant>>>(Wk_blocks, d_Wk_meta->global_scale_dec, d_Wk, total_size_q);
+    CUDA_CHECK(cudaGetLastError());
+
+    dequantize_nvfp4_kernel<<<grid_wv, block_dequant>>>(Wv_blocks, d_Wv_meta->global_scale_dec, d_Wv, total_size_v);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Allocate temporary buffers for Q, K, V, QK, A
+    float *d_Q, *d_K, *d_V, *d_QK, *d_A;
+    CUDA_CHECK(cudaMalloc(&d_Q, batch * seq_len * d_k * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_K, batch * seq_len * d_k * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_V, batch * seq_len * d_v * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_QK, batch * seq_len * seq_len * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_A, batch * seq_len * seq_len * sizeof(float)));
+
+    dim3 block_proj(16, 16);
+
+    // Step 0-1: Compute Q = X·Wq + bq (using dequantized weights)
+    dim3 grid_q((d_k + block_proj.x - 1) / block_proj.x,
+                (seq_len + block_proj.y - 1) / block_proj.y,
+                batch);
+    linear_projection_tiled_kernel<<<grid_q, block_proj>>>(d_X, d_Wq, d_bq, d_Q, batch, seq_len, d_model, d_k);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Step 0-2: Compute K = X·Wk + bk (using dequantized weights)
+    dim3 grid_k((d_k + block_proj.x - 1) / block_proj.x,
+                (seq_len + block_proj.y - 1) / block_proj.y,
+                batch);
+    linear_projection_tiled_kernel<<<grid_k, block_proj>>>(d_X, d_Wk, d_bk, d_K, batch, seq_len, d_model, d_k);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Step 0-3: Compute V = X·Wv + bv (using dequantized weights)
+    dim3 grid_v((d_v + block_proj.x - 1) / block_proj.x,
+                (seq_len + block_proj.y - 1) / block_proj.y,
+                batch);
+    linear_projection_tiled_kernel<<<grid_v, block_proj>>>(d_X, d_Wv, d_bv, d_V, batch, seq_len, d_model, d_v);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Step 1: Q·Kᵀ MatMul
+    dim3 block1(16, 16);
+    dim3 grid1((seq_len + block1.x - 1) / block1.x,
+               (seq_len + block1.y - 1) / block1.y,
+               batch);
+    qk_matmul_tiled_kernel<<<grid1, block1>>>(d_Q, d_K, d_QK, batch, seq_len, d_k);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Step 2: Scaling + Masking
+    float scale_factor = 1.0f / sqrtf((float)d_k);
+    scale_mask_kernel<<<grid1, block1>>>(d_QK, batch, seq_len, scale_factor, causal_mask);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Step 3: Softmax
+    dim3 block2(CHUNK_SIZE);
+    dim3 grid2(seq_len, batch);
+    softmax_kernel<<<grid2, block2>>>(d_QK, d_A, batch, seq_len);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Step 4: A·V MatMul
+    dim3 block3(16, 16);
+    dim3 grid3((d_v + block3.x - 1) / block3.x,
+               (seq_len + block3.y - 1) / block3.y,
+               batch);
+    av_matmul_tiled_kernel<<<grid3, block3>>>(d_A, d_V, d_output, batch, seq_len, d_v);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Free temporary buffers
+    CUDA_CHECK(cudaFree(d_Q));
+    CUDA_CHECK(cudaFree(d_K));
+    CUDA_CHECK(cudaFree(d_V));
+    CUDA_CHECK(cudaFree(d_QK));
+    CUDA_CHECK(cudaFree(d_A));
+    CUDA_CHECK(cudaFree(d_Wq));
+    CUDA_CHECK(cudaFree(d_Wk));
+    CUDA_CHECK(cudaFree(d_Wv));
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
