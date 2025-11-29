@@ -1,7 +1,7 @@
 # Fused CUDA Kernels for Quantized LLM Attention
 
 This repository explores the design and implementation of a fused CUDA kernel tailored for **quantized Large Language Models (LLMs)**, focusing on **attention layers** that operate on **block-wise quantized weights**, (e.g., NF4, MXFP4, NVFP4).  
-The core objective is to integrate **dequantization** and **attention operations** (matmul, scaling, masking, softmax, ...) into a single I/O-aware kernel to substantially reduce memory traffic and improve inference throughput.  
+The core objective is to integrate **dequantization** and **Q/K/V projection operations** into a single I/O-aware kernel, followed by a separate fused attention kernel, to substantially reduce memory traffic and improve inference throughput.  
 > This project was implemented using CUDA 12.4.
 
 
@@ -38,9 +38,29 @@ make run_eval
 
 ## 🚀 Overview
 
-Attention in modern Large Language Models (LLMs) is fundamentally **memory-bound**, as it requires multiple passes over large activation and weight tensors across several independent CUDA kernels. When using **block-wise weight-only quantization** formats such as NF4, MXFP4, or NVFP4, an additional overhead is introduced by **dequantization**, which is typically executed as a standalone kernel. This increases global memory traffic and undermines the data locality necessary for high-throughput inference.
+Naïve attention implementations in modern Large Language Models (LLMs) are fundamentally **memory-bound**, as it requires multiple passes over large activation and weight tensors across several independent CUDA kernels. When using **block-wise weight-only quantization** formats such as NF4, MXFP4, or NVFP4, an additional overhead is introduced by **dequantization**, which is typically executed as a standalone kernel. This increases global memory traffic and undermines the data locality necessary for high-throughput inference.
 
 This project addresses these challenges by introducing a **two-kernel, quantization-aware fused attention pipeline**, inspired by the I/O-aware philosophy of FlashAttention but optimized for quantized LLMs. The objective is to reorganize computation so that intermediate results remain on-chip, minimizing redundant memory transfers.
+
+### Why Block-wise Quantization Requires Fused Dequantization
+
+**Block-wise Quantization** offers lower quantization error compared to element-wise quantization, but it necessitates a dequantization step during inference. This process requires **metadata** such as per-block scale factors, zero-points, and **Look-Up Tables (LUT)** for formats like NF4 that map quantized indices to floating-point values. There are two approaches to handle this:
+
+#### Offline Dequantization (Pre-conversion)
+- Dequantized Q', K', V' tensors (fp32) reside in memory
+- Original quantized tensors often cannot be freed immediately due to implementation constraints
+- Effectively results in memory usage similar to an "fp32 model"
+- **→ Minimal memory benefits**
+
+#### Fused Dequantization (On-the-fly) ✅
+- No intermediate fp32 tensors stored in memory
+- Dequantization results are consumed directly in registers
+- **→ For FP32 → 4-bit quantization, weight memory usage is reduced by ~8x**
+  - *(Actual: ~5.5x–7x reduction due to metadata overhead: scales, zero-points, and LUTs)*
+
+Our implementation leverages **fused dequantization** to achieve substantial memory savings while maintaining computational efficiency.
+
+### Two-Kernel Architecture
 
 Our design consists of two fused kernels:
 
