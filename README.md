@@ -1,4 +1,4 @@
-# Fused CUDA Kernels for Quantized LLM Attention
+# 🔥 Fused CUDA Kernels for Quantized LLM Attention
 
 This repository explores the design and implementation of a fused CUDA kernel tailored for **quantized Large Language Models (LLMs)**, focusing on **attention layers** that operate on **block-wise quantized weights**, (e.g., NF4, MXFP4, NVFP4).  
 The core objective is to integrate **dequantization** and **Q/K/V projection operations** into a single I/O-aware kernel, followed by a separate fused attention kernel, to substantially reduce memory traffic and improve inference throughput.  
@@ -7,7 +7,7 @@ The core objective is to integrate **dequantization** and **Q/K/V projection ope
 
 ## 🚀 Quick Start
 
-### Extract Real GPT-2 Weights (Recommended)
+### 📦 Extract Real GPT-2 Weights (Recommended)
 
 For more realistic evaluation, you can use actual GPT-2 attention weights:
 
@@ -29,30 +29,30 @@ This will create a `weights/` directory containing:
 
 The evaluation code will automatically load these weights if available, otherwise it falls back to random initialization.
 
-### Build and Run
+### ⚙️ Build and Run
 
 ```bash
 make run_eval
 ```
 
 
-## 🚀 Overview
+## 📊 Overview
 
 Naïve attention implementations in modern Large Language Models (LLMs) are fundamentally **memory-bound**, as it requires multiple passes over large activation and weight tensors across several independent CUDA kernels. When using **block-wise weight-only quantization** formats such as NF4, MXFP4, or NVFP4, an additional overhead is introduced by **dequantization**, which is typically executed as a standalone kernel. This increases global memory traffic and undermines the data locality necessary for high-throughput inference.
 
 This project addresses these challenges by introducing a **two-kernel, quantization-aware fused attention pipeline**, inspired by the I/O-aware philosophy of FlashAttention but optimized for quantized LLMs. The objective is to reorganize computation so that intermediate results remain on-chip, minimizing redundant memory transfers.
 
-### Why Block-wise Quantization Requires Fused Dequantization
+### 🔢 Why Block-wise Quantization Requires Fused Dequantization
 
 **Block-wise Quantization** offers lower quantization error compared to element-wise quantization, but it necessitates a dequantization step during inference. This process requires **metadata** such as per-block scale factors, zero-points, and **Look-Up Tables (LUT)** for formats like NF4 that map quantized indices to floating-point values. There are two approaches to handle this:
 
-#### Offline Dequantization (Pre-conversion)
+#### ❌ Offline Dequantization (Pre-conversion)
 - Dequantized Q', K', V' tensors (fp32) reside in memory
 - Original quantized tensors often cannot be freed immediately due to implementation constraints
 - Effectively results in memory usage similar to an "fp32 model"
 - **→ Minimal memory benefits**
 
-#### Fused Dequantization (On-the-fly) ✅
+#### ✅ Fused Dequantization (On-the-fly)
 - No intermediate fp32 tensors stored in memory
 - Dequantization results are consumed directly in registers
 - **→ For FP32 → 4-bit quantization, weight memory usage is reduced by ~8x**
@@ -60,24 +60,24 @@ This project addresses these challenges by introducing a **two-kernel, quantizat
 
 Our implementation leverages **fused dequantization** to achieve substantial memory savings while maintaining computational efficiency.
 
-### Two-Kernel Architecture
+### 🧱 Two-Kernel Architecture
 
 Our design consists of two fused kernels:
 
-### 1. First Kernel — Block Dequantization + Fused Q/K/V Projection
+### 1️⃣ First Kernel — Block Dequantization + Fused Q/K/V Projection
 This kernel performs block-wise dequantization of the quantized weight matrices and immediately consumes the dequantized values within a tiled matmul to compute $[Q\,|\,K\,|\,V] = X[W_Q\,|\,W_K\,|\,W_V]$.
 Without writing dequantized weights back to global memory, it significantly reduces memory I/O and preserves data locality.
 
-### 2. Second Kernel — Flash-style Tiled Attention
+### 2️⃣ Second Kernel — Flash-style Tiled Attention
 This kernel implements the core attention pipeline in a fully fused manner.
 The tiled execution reuses Q, K, and V efficiently across shared memory and registers, further minimizing global memory access.
 
 This two-kernel architecture balances aggressive operator fusion with practical implementation constraints. Compared to conventional multi-kernel attention and quantization workflows, it **significantly lowers memory traffic**, enhances **on-chip data reuse**, and delivers **substantial inference throughput improvements** for quantized LLMs.
 
 
-# Baselines
+# 📋 Baselines
 
-## Naïve Sequential Attention
+## 🐌 Naïve Sequential Attention
 
 There are six kernel functions, each of which is for:
 
@@ -91,7 +91,7 @@ There are six kernel functions, each of which is for:
 5. $\text{softmax}({QK^\top\over{\sqrt{d_k}}})$
 6. Naïve matmul: $\text{Attention}(Q, K, V) = \text{softmax}({QK^\top\over{\sqrt{d_k}}}) V$ 
 
-## Tiled Sequential Attention
+## 🧩 Tiled Sequential Attention
 
 There are six kernel functions, each of which is for:
 
@@ -105,7 +105,7 @@ There are six kernel functions, each of which is for:
 5. $\text{chunk-wise softmax}({QK^\top\over{\sqrt{d_k}}})$
 6. Tiled matmul: $\text{Attention}(Q, K, V) = \text{chunk-wise softmax}({QK^\top\over{\sqrt{d_k}}}) V$
 
-## Tiled Fused Attention (Flash-style)
+## ⚡ Tiled Fused Attention (Flash-style)
 
 There are three kernel functions, each of which is for:
 
@@ -126,7 +126,7 @@ There are three kernel functions, each of which is for:
     Tiled matmul: $\text{Attention}(Q, K, V) = \text{chunk-wise softmax}({QK^\top\over{\sqrt{d_k}}}) V$
 
 
-# Quantization-Aware Tiled Fused Attention (Ours)
+# 🎯 Quantization-Aware Tiled Fused Attention (Ours)
 
 There are two kernel functions, each of which is for:
 
