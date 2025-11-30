@@ -150,6 +150,7 @@ There are two kernel functions, each of which is for:
 
 # Evaluation
 ![3090_result](results/performance_NVIDIA_GeForce_RTX_3090_20251130_122649.png)
+![6000_result](results/performance_NVIDIA_RTX_6000_Ada_Generation_20251130_043231.png)
 
 
 
