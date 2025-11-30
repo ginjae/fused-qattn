@@ -4,6 +4,8 @@
 #include <math.h>
 #include <unistd.h>
 #include <algorithm>
+#include <time.h>
+#include <sys/stat.h>
 #include "quantization_utils.cuh"
 #include "attn_naive.cuh"
 #include "attn_tiled.cuh"
@@ -1322,6 +1324,74 @@ int main() {
            time_nvfp4_naive/time_nvfp4_ours);
     printf("======================================================================================\n");
     printf("\n");
+
+    // Save results to CSV file
+    // Create results directory if it doesn't exist
+    mkdir("results", 0755);
+    
+    // Get current time
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    char timestamp[64];
+    strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", t);
+    
+    // Get GPU name
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+    char gpu_name[256];
+    snprintf(gpu_name, sizeof(gpu_name), "%s", prop.name);
+    // Replace spaces with underscores for filename
+    for (int i = 0; gpu_name[i]; i++) {
+        if (gpu_name[i] == ' ') gpu_name[i] = '_';
+    }
+    
+    // Create filename
+    char csv_filename[512];
+    snprintf(csv_filename, sizeof(csv_filename), "results/performance_%s_%s.csv", gpu_name, timestamp);
+    
+    // Write CSV file
+    FILE* csv_file = fopen(csv_filename, "w");
+    if (csv_file) {
+        // Write header
+        fprintf(csv_file, "Implementation,No_Quant_ms,MXFP4_ms,NF4_ms,NVFP4_ms\n");
+        
+        // Write performance data
+        fprintf(csv_file, "Naive,%.4f,%.4f,%.4f,%.4f\n", 
+                time_unquant_naive, time_mxfp4_naive, time_nf4_naive, time_nvfp4_naive);
+        fprintf(csv_file, "Tiled,%.4f,%.4f,%.4f,%.4f\n", 
+                time_unquant_tiled, time_mxfp4_tiled, time_nf4_tiled, time_nvfp4_tiled);
+        fprintf(csv_file, "Flash,%.4f,%.4f,%.4f,%.4f\n", 
+                time_unquant_flash, time_mxfp4_flash, time_nf4_flash, time_nvfp4_flash);
+        fprintf(csv_file, "Ours,N/A,%.4f,%.4f,%.4f\n", 
+                time_mxfp4_ours, time_nf4_ours, time_nvfp4_ours);
+        
+        // // Write blank line
+        // fprintf(csv_file, "\n");
+        
+        // // Write speedup header
+        // fprintf(csv_file, "Speedup_vs_Naive,No_Quant,MXFP4,NF4,NVFP4\n");
+        
+        // // Write speedup data
+        // fprintf(csv_file, "Tiled,%.2fx,%.2fx,%.2fx,%.2fx\n",
+        //         time_unquant_naive/time_unquant_tiled,
+        //         time_mxfp4_naive/time_mxfp4_tiled,
+        //         time_nf4_naive/time_nf4_tiled,
+        //         time_nvfp4_naive/time_nvfp4_tiled);
+        // fprintf(csv_file, "Flash,%.2fx,%.2fx,%.2fx,%.2fx\n",
+        //         time_unquant_naive/time_unquant_flash,
+        //         time_mxfp4_naive/time_mxfp4_flash,
+        //         time_nf4_naive/time_nf4_flash,
+        //         time_nvfp4_naive/time_nvfp4_flash);
+        // fprintf(csv_file, "Ours,N/A,%.2fx,%.2fx,%.2fx\n",
+        //         time_mxfp4_naive/time_mxfp4_ours,
+        //         time_nf4_naive/time_nf4_ours,
+        //         time_nvfp4_naive/time_nvfp4_ours);
+        
+        fclose(csv_file);
+        printf("Performance results saved to: %s\n\n", csv_filename);
+    } else {
+        fprintf(stderr, "Warning: Could not create CSV file: %s\n", csv_filename);
+    }
 
 
     // Cleanup CUDA events

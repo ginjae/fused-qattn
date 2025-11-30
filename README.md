@@ -148,6 +148,11 @@ There are two kernel functions, each of which is for:
     \+
     Tiled matmul: $\text{Attention}(Q, K, V) = \text{chunk-wise softmax}({QK^\top\over{\sqrt{d_k}}}) V$
 
+# Evaluation
+![3090_result](results/performance_NVIDIA_GeForce_RTX_3090_20251130_122649.png)
+
+
+
 
 ## 🤝 Contributors
 
