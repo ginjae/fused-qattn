@@ -647,11 +647,15 @@ void flash_attention_nvfp4(
     int d_model,
     int d_k,
     int d_v,
-    bool causal_mask = false
+    bool causal_mask = false,
+    float* kernel_times = nullptr,
+    int* num_kernels = nullptr
 ) {
     const NVFP4Block* Wq_blocks = static_cast<const NVFP4Block*>(d_Wq_nvfp4);
     const NVFP4Block* Wk_blocks = static_cast<const NVFP4Block*>(d_Wk_nvfp4);
     const NVFP4Block* Wv_blocks = static_cast<const NVFP4Block*>(d_Wv_nvfp4);
+
+    if (num_kernels) *num_kernels = 5;
 
     // Allocate temporary buffers for dequantized weights
     float *d_Wq, *d_Wk, *d_Wv;
@@ -999,53 +1003,6 @@ void naive_flash_attention_nf4(
         CUDA_CHECK(cudaGetLastError());
         
         dequantize_nf4_kernel<<<grid_wk, block_dequant>>>(Wk_blocks, d_Wk, total_size_q);
-            CUDA_CHECK(cudaEventRecord(stops[1]));
-            
-            CUDA_CHECK(cudaEventRecord(starts[2]));
-            dequantize_nf4_kernel<<<grid_wv, block_dequant>>>(Wv_blocks, d_Wv, total_size_v);
-            CUDA_CHECK(cudaEventRecord(stops[2]));
-            
-            CUDA_CHECK(cudaEventRecord(starts[3]));
-            linear_projection_kernel<<<grid_q, block_proj>>>(d_X, d_Wq, d_bq, d_Q, batch, seq_len, d_model, d_k);
-            CUDA_CHECK(cudaEventRecord(stops[3]));
-            
-            CUDA_CHECK(cudaEventRecord(starts[4]));
-            linear_projection_kernel<<<grid_k, block_proj>>>(d_X, d_Wk, d_bk, d_K, batch, seq_len, d_model, d_k);
-            CUDA_CHECK(cudaEventRecord(stops[4]));
-            
-            CUDA_CHECK(cudaEventRecord(starts[5]));
-            linear_projection_kernel<<<grid_v, block_proj>>>(d_X, d_Wv, d_bv, d_V, batch, seq_len, d_model, d_v);
-            CUDA_CHECK(cudaEventRecord(stops[5]));
-            
-            CUDA_CHECK(cudaEventRecord(starts[6]));
-            flash_attention_kernel<<<grid_fused_qk, block_fused_qk, shared_bytes>>>(
-                d_Q, d_K, d_V, d_output, batch, seq_len, d_k, d_v, scale_factor, causal_mask);
-            CUDA_CHECK(cudaEventRecord(stops[6]));
-            
-            CUDA_CHECK(cudaDeviceSynchronize());
-            
-            for (int k = 0; k < NUM_KERNELS; k++) {
-                CUDA_CHECK(cudaEventElapsedTime(&all_times[iter][k], starts[k], stops[k]));
-            }
-        }
-        
-        for (int k = 0; k < NUM_KERNELS; k++) {
-            float times_for_kernel[TIMING_NUM_ITERATIONS];
-            for (int i = 0; i < TIMING_NUM_ITERATIONS; i++) {
-                times_for_kernel[i] = all_times[i][k];
-            }
-            kernel_times[k] = compute_median_local(times_for_kernel, TIMING_NUM_ITERATIONS);
-        }
-        
-        for (int i = 0; i < NUM_KERNELS; i++) {
-            CUDA_CHECK(cudaEventDestroy(starts[i]));
-            CUDA_CHECK(cudaEventDestroy(stops[i]));
-        }
-    } else {
-        dequantize_nf4_kernel<<<grid_wq, block_dequant>>>(Wq_blocks, d_Wq, total_size_q);
-        CUDA_CHECK(cudaGetLastError());
-        
-        dequantize_nf4_kernel<<<grid_wk, block_dequant>>>(Wk_blocks, d_Wk, total_size_q);
         CUDA_CHECK(cudaGetLastError());
         
         dequantize_nf4_kernel<<<grid_wv, block_dequant>>>(Wv_blocks, d_Wv, total_size_v);
@@ -1092,11 +1049,16 @@ void naive_flash_attention_nvfp4(
     int d_model,
     int d_k,
     int d_v,
-    bool causal_mask = false
+    bool causal_mask = false,
+    float* kernel_times = nullptr,
+    int* num_kernels = nullptr
 ) {
     const NVFP4Block* Wq_blocks = static_cast<const NVFP4Block*>(d_Wq_nvfp4);
     const NVFP4Block* Wk_blocks = static_cast<const NVFP4Block*>(d_Wk_nvfp4);
     const NVFP4Block* Wv_blocks = static_cast<const NVFP4Block*>(d_Wv_nvfp4);
+
+    // Set kernel count (timing not implemented yet for this function)
+    if (num_kernels) *num_kernels = 7;
 
     // Allocate temporary buffers for dequantized weights
     float *d_Wq, *d_Wk, *d_Wv;
@@ -1104,7 +1066,7 @@ void naive_flash_attention_nvfp4(
     CUDA_CHECK(cudaMalloc(&d_Wk, d_model * d_k * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_Wv, d_model * d_v * sizeof(float)));
 
-    // Dequantize MXFP4 weights
+    // Dequantize NVFP4 weights
     int total_size_q = d_model * d_k;
     int total_size_v = d_model * d_v;
     
@@ -1122,7 +1084,7 @@ void naive_flash_attention_nvfp4(
     dequantize_nvfp4_kernel<<<grid_wv, block_dequant>>>(Wv_blocks, d_Wv_meta->global_scale_dec, d_Wv, total_size_v);
     CUDA_CHECK(cudaGetLastError());
     
-    // Allocate temporary buffers for Q, K, V, A (no need for QK anymore!)
+    // Allocate temporary buffers for Q, K, V
     float *d_Q, *d_K, *d_V;
     CUDA_CHECK(cudaMalloc(&d_Q, batch * seq_len * d_k * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_K, batch * seq_len * d_k * sizeof(float)));
@@ -1313,11 +1275,15 @@ void fused_flash_attention_nf4(
     int d_model,
     int d_k,
     int d_v,
-    bool causal_mask = false
+    bool causal_mask = false,
+    float* kernel_times = nullptr,
+    int* num_kernels = nullptr
 ) {
     const NF4Block* Wq_blocks = static_cast<const NF4Block*>(d_Wq_nf4);
     const NF4Block* Wk_blocks = static_cast<const NF4Block*>(d_Wk_nf4);
     const NF4Block* Wv_blocks = static_cast<const NF4Block*>(d_Wv_nf4);
+
+    if (num_kernels) *num_kernels = 3;
 
     // Allocate temporary buffers for dequantized weights
     float *d_Wq, *d_Wk, *d_Wv;
@@ -1393,11 +1359,15 @@ void fused_flash_attention_nvfp4(
     int d_model,
     int d_k,
     int d_v,
-    bool causal_mask = false
+    bool causal_mask = false,
+    float* kernel_times = nullptr,
+    int* num_kernels = nullptr
 ) {
     const NVFP4Block* Wq_blocks = static_cast<const NVFP4Block*>(d_Wq_nvfp4);
     const NVFP4Block* Wk_blocks = static_cast<const NVFP4Block*>(d_Wk_nvfp4);
     const NVFP4Block* Wv_blocks = static_cast<const NVFP4Block*>(d_Wv_nvfp4);
+
+    if (num_kernels) *num_kernels = 3;
 
     // Allocate temporary buffers for dequantized weights
     float *d_Wq, *d_Wk, *d_Wv;
