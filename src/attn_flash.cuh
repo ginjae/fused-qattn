@@ -78,7 +78,9 @@ void flash_attention_nf4(
     int d_model,
     int d_k,
     int d_v,
-    bool causal_mask = false
+    bool causal_mask = false,
+    float* kernel_times = nullptr,
+    int* num_kernels = nullptr
 );
 
 void flash_attention_nvfp4(
@@ -98,7 +100,9 @@ void flash_attention_nvfp4(
     int d_model,
     int d_k,
     int d_v,
-    bool causal_mask = false
+    bool causal_mask = false,
+    float* kernel_times = nullptr,
+    int* num_kernels = nullptr
 );
 
 void naive_flash_attention_mxfp4(
@@ -134,7 +138,9 @@ void naive_flash_attention_nf4(
     int d_model,
     int d_k,
     int d_v,
-    bool causal_mask = false
+    bool causal_mask = false,
+    float* kernel_times = nullptr,
+    int* num_kernels = nullptr
 );
 
 void naive_flash_attention_nvfp4(
@@ -154,7 +160,9 @@ void naive_flash_attention_nvfp4(
     int d_model,
     int d_k,
     int d_v,
-    bool causal_mask = false
+    bool causal_mask = false,
+    float* kernel_times = nullptr,
+    int* num_kernels = nullptr
 );
 
 void fused_flash_attention_mxfp4(
@@ -190,7 +198,9 @@ void fused_flash_attention_nf4(
     int d_model,
     int d_k,
     int d_v,
-    bool causal_mask = false
+    bool causal_mask = false,
+    float* kernel_times = nullptr,
+    int* num_kernels = nullptr
 );
 
 void fused_flash_attention_nvfp4(
@@ -210,7 +220,9 @@ void fused_flash_attention_nvfp4(
     int d_model,
     int d_k,
     int d_v,
-    bool causal_mask = false
+    bool causal_mask = false,
+    float* kernel_times = nullptr,
+    int* num_kernels = nullptr
 );
 
 #endif // ATTN_FLASH_CUH

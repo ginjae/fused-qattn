@@ -637,6 +637,9 @@ int main() {
 
     // Run multiple iterations
     printf("Running %d iterations...\n", NUM_ITERATIONS);
+    float kernel_times_nf4_naive[MAX_KERNELS];
+    int num_kernels_nf4_naive = 0;
+    
     for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
         CUDA_CHECK(cudaEventRecord(start));
         naive_flash_attention_nf4(
@@ -644,13 +647,29 @@ int main() {
             d_Wq_nf4, d_Wk_nf4, d_Wv_nf4,
             d_bq, d_bk, d_bv,
             d_output, batch, seq_len, d_model, d_k, d_v,
-            false
+            false,
+            (iter == 0) ? kernel_times_nf4_naive : nullptr,
+            (iter == 0) ? &num_kernels_nf4_naive : nullptr
         );
         CUDA_CHECK(cudaEventRecord(stop));
         CUDA_CHECK(cudaEventSynchronize(stop));
         CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
     }
     elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
+    printf("Median execution time: %.4f ms\n", elapsed_time_quant);
+    
+    printf("\nKernel Latency Breakdown:\n");
+    printf("  1. Dequantize Wq:             %.4f ms\n", kernel_times_nf4_naive[0]);
+    printf("  2. Dequantize Wk:             %.4f ms\n", kernel_times_nf4_naive[1]);
+    printf("  3. Dequantize Wv:             %.4f ms\n", kernel_times_nf4_naive[2]);
+    printf("  4. Linear Projection Q:       %.4f ms\n", kernel_times_nf4_naive[3]);
+    printf("  5. Linear Projection K:       %.4f ms\n", kernel_times_nf4_naive[4]);
+    printf("  6. Linear Projection V:       %.4f ms\n", kernel_times_nf4_naive[5]);
+    printf("  7. Flash Attention:           %.4f ms\n", kernel_times_nf4_naive[6]);
+    printf("  ----------------------------------------\n");
+    float total_nf4_naive = 0;
+    for (int i = 0; i < num_kernels_nf4_naive; i++) total_nf4_naive += kernel_times_nf4_naive[i];
+    printf("  Total (sum):                  %.4f ms\n", total_nf4_naive);
 
     // Copy NF4 result back
     CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
@@ -760,13 +779,18 @@ int main() {
 
     // Run multiple iterations
     printf("Running %d iterations...\n", NUM_ITERATIONS);
+    float kernel_times_nf4_ours[MAX_KERNELS];
+    int num_kernels_nf4_ours = 0;
+    
     for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
         CUDA_CHECK(cudaEventRecord(start));
         our_attention_nf4(d_X, 
                           d_Wq_nf4, d_Wk_nf4, d_Wv_nf4,
                           d_bq, d_bk, d_bv,
                           d_output, batch, seq_len, d_model, d_k, d_v,
-                          false);
+                          false,
+                          (iter == 0) ? kernel_times_nf4_ours : nullptr,
+                          (iter == 0) ? &num_kernels_nf4_ours : nullptr);
         CUDA_CHECK(cudaEventRecord(stop));
         CUDA_CHECK(cudaEventSynchronize(stop));
         CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
@@ -778,6 +802,14 @@ int main() {
 
     time_nf4_ours = elapsed_time_quant;
     printf("Median execution time: %.4f ms\n", elapsed_time_quant);
+    
+    printf("\nKernel Latency Breakdown:\n");
+    printf("  1. Fused Dequant+Projection:  %.4f ms\n", kernel_times_nf4_ours[0]);
+    printf("  2. Our Attention Kernel:      %.4f ms\n", kernel_times_nf4_ours[1]);
+    printf("  ----------------------------------------\n");
+    float total_nf4_ours = 0;
+    for (int i = 0; i < num_kernels_nf4_ours; i++) total_nf4_ours += kernel_times_nf4_ours[i];
+    printf("  Total (sum):                  %.4f ms\n", total_nf4_ours);
     
     // // Compare with baseline (both NF4, should match closely)
     // compute_error_metrics("Our NF4 vs Naive NF4", h_naive_baseline_nf4, h_result_temp, 
@@ -917,6 +949,9 @@ int main() {
 
     // Run multiple iterations
     printf("Running %d iterations...\n", NUM_ITERATIONS);
+    float kernel_times_nvfp4_naive[MAX_KERNELS];
+    int num_kernels_nvfp4_naive = 0;
+    
     for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
         CUDA_CHECK(cudaEventRecord(start));
         naive_flash_attention_nvfp4(d_X, 
@@ -924,7 +959,9 @@ int main() {
                                     &h_Wq_nvfp4_meta, &h_Wk_nvfp4_meta, &h_Wv_nvfp4_meta,
                                     d_bq, d_bk, d_bv,
                                     d_output, batch, seq_len, d_model, d_k, d_v,
-                                    false);
+                                    false,
+                                    (iter == 0) ? kernel_times_nvfp4_naive : nullptr,
+                                    (iter == 0) ? &num_kernels_nvfp4_naive : nullptr);
         CUDA_CHECK(cudaEventRecord(stop));
         CUDA_CHECK(cudaEventSynchronize(stop));
         CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
@@ -936,6 +973,19 @@ int main() {
 
     time_nvfp4_naive = elapsed_time_quant;
     printf("Median execution time: %.4f ms\n", elapsed_time_quant);
+    
+    printf("\nKernel Latency Breakdown:\n");
+    printf("  1. Dequantize Wq:             %.4f ms\n", kernel_times_nvfp4_naive[0]);
+    printf("  2. Dequantize Wk:             %.4f ms\n", kernel_times_nvfp4_naive[1]);
+    printf("  3. Dequantize Wv:             %.4f ms\n", kernel_times_nvfp4_naive[2]);
+    printf("  4. Linear Projection Q:       %.4f ms\n", kernel_times_nvfp4_naive[3]);
+    printf("  5. Linear Projection K:       %.4f ms\n", kernel_times_nvfp4_naive[4]);
+    printf("  6. Linear Projection V:       %.4f ms\n", kernel_times_nvfp4_naive[5]);
+    printf("  7. Flash Attention:           %.4f ms\n", kernel_times_nvfp4_naive[6]);
+    printf("  ----------------------------------------\n");
+    float total_nvfp4_naive = 0;
+    for (int i = 0; i < num_kernels_nvfp4_naive; i++) total_nvfp4_naive += kernel_times_nvfp4_naive[i];
+    printf("  Total (sum):                  %.4f ms\n", total_nvfp4_naive);
     
     // // Compare with unquantized baseline (using 4-bit quantized thresholds)
     // compute_error_metrics("Naive NVFP4 vs Naive Baseline", h_baseline_unquantized, h_result_temp, 
@@ -1034,6 +1084,9 @@ int main() {
 
     // Run multiple iterations
     printf("Running %d iterations...\n", NUM_ITERATIONS);
+    float kernel_times_nvfp4_ours[MAX_KERNELS];
+    int num_kernels_nvfp4_ours = 0;
+    
     for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
         CUDA_CHECK(cudaEventRecord(start));
         our_attention_nvfp4(d_X, 
@@ -1041,7 +1094,9 @@ int main() {
                             &h_Wq_nvfp4_meta, &h_Wk_nvfp4_meta, &h_Wv_nvfp4_meta,
                             d_bq, d_bk, d_bv,
                             d_output, batch, seq_len, d_model, d_k, d_v,
-                            false);
+                            false,
+                            (iter == 0) ? kernel_times_nvfp4_ours : nullptr,
+                            (iter == 0) ? &num_kernels_nvfp4_ours : nullptr);
         CUDA_CHECK(cudaEventRecord(stop));
         CUDA_CHECK(cudaEventSynchronize(stop));
         CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
@@ -1053,6 +1108,14 @@ int main() {
 
     time_nvfp4_ours = elapsed_time_quant;
     printf("Median execution time: %.4f ms\n", elapsed_time_quant);
+    
+    printf("\nKernel Latency Breakdown:\n");
+    printf("  1. Fused Dequant+Projection:  %.4f ms\n", kernel_times_nvfp4_ours[0]);
+    printf("  2. Our Attention Kernel:      %.4f ms\n", kernel_times_nvfp4_ours[1]);
+    printf("  ----------------------------------------\n");
+    float total_nvfp4_ours = 0;
+    for (int i = 0; i < num_kernels_nvfp4_ours; i++) total_nvfp4_ours += kernel_times_nvfp4_ours[i];
+    printf("  Total (sum):                  %.4f ms\n", total_nvfp4_ours);
     
     // Compare with baseline (both NVFP4, should match closely)
     compute_error_metrics("Our NVFP4 vs Naive NVFP4", h_naive_baseline_nvfp4, h_result_temp, 
