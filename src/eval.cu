@@ -11,6 +11,7 @@
 #include "attn_tiled.cuh"
 #include "attn_flash.cuh"
 #include "attn_ours.cuh"
+#include "attn_full.cuh"
 #include "npy_loader.h"
 
 #define NUM_ITERATIONS 100
@@ -513,6 +514,41 @@ int main() {
 
     printf("\n");
 
+    // Test 5: Full Attention (MXFP4)
+    cooldown_gpu(COOLDOWN_SECONDS);
+    printf("\n5. Full Attention (MXFP4) - Chunk-based Tiling\n");
+
+    printf("Running dummy run for warm-up...\n");
+    full_attention_mxfp4(d_X, 
+                         d_Wq_mxfp4, d_Wk_mxfp4, d_Wv_mxfp4,
+                         d_bq, d_bk, d_bv,
+                         d_output, batch, seq_len, d_model, d_k, d_v,
+                         false);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Run multiple iterations
+    printf("Running %d iterations...\n", NUM_ITERATIONS);
+    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
+        CUDA_CHECK(cudaEventRecord(start));
+        full_attention_mxfp4(d_X, 
+                             d_Wq_mxfp4, d_Wk_mxfp4, d_Wv_mxfp4,
+                             d_bq, d_bk, d_bv,
+                             d_output, batch, seq_len, d_model, d_k, d_v,
+                             false);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
+    }
+    elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
+
+    // Copy Full MXFP4 result back
+    CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
+
+    float time_mxfp4_full = elapsed_time_quant;
+    printf("Median execution time: %.4f ms\n", elapsed_time_quant);
+
+    printf("\n");
+
     printf("\n=== Quantized Weights Tests (NF4) ===\n");
 
     // Quantize weights to NF4
@@ -739,6 +775,43 @@ int main() {
     // // Compare with baseline (both NF4, should match closely)
     // compute_error_metrics("Our NF4 vs Naive NF4", h_naive_baseline_nf4, h_result_temp, 
     //                      batch, seq_len, d_v, UNQUANTIZED);
+
+    printf("\n");
+
+    // Test 5: Full Attention (NF4)
+    cooldown_gpu(COOLDOWN_SECONDS);
+    printf("\n5. Full Attention (NF4) - Chunk-based Tiling\n");
+
+    printf("Running dummy run for warm-up...\n");
+    full_attention_nf4(
+        d_X, 
+        d_Wq_nf4, d_Wk_nf4, d_Wv_nf4,
+        d_bq, d_bk, d_bv,
+        d_output, batch, seq_len, d_model, d_k, d_v,
+        false
+    );
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Run multiple iterations
+    printf("Running %d iterations...\n", NUM_ITERATIONS);
+    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
+        CUDA_CHECK(cudaEventRecord(start));
+        full_attention_nf4(d_X, 
+                          d_Wq_nf4, d_Wk_nf4, d_Wv_nf4,
+                          d_bq, d_bk, d_bv,
+                          d_output, batch, seq_len, d_model, d_k, d_v,
+                          false);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
+    }
+    elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
+
+    // Copy Full NF4 result back
+    CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
+
+    float time_nf4_full = elapsed_time_quant;
+    printf("Median execution time: %.4f ms\n", elapsed_time_quant);
 
     printf("\n");
 
@@ -974,6 +1047,47 @@ int main() {
     compute_error_metrics("Our NVFP4 vs Naive NVFP4", h_naive_baseline_nvfp4, h_result_temp, 
                          batch, seq_len, d_v, UNQUANTIZED);
 
+    // Test 5: Full Attention (NVFP4)
+    cooldown_gpu(COOLDOWN_SECONDS);
+    printf("\n5. Full Attention (NVFP4) - Chunk-based Tiling\n");
+
+    // Recreate events (they were destroyed)
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    printf("Running dummy run for warm-up...\n");
+    full_attention_nvfp4(d_X, 
+                        d_Wq_nvfp4, d_Wk_nvfp4, d_Wv_nvfp4,
+                        &h_Wq_nvfp4_meta, &h_Wk_nvfp4_meta, &h_Wv_nvfp4_meta,
+                        d_bq, d_bk, d_bv,
+                        d_output, batch, seq_len, d_model, d_k, d_v,
+                        false);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Run multiple iterations
+    printf("Running %d iterations...\n", NUM_ITERATIONS);
+    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
+        CUDA_CHECK(cudaEventRecord(start));
+        full_attention_nvfp4(d_X, 
+                            d_Wq_nvfp4, d_Wk_nvfp4, d_Wv_nvfp4,
+                            &h_Wq_nvfp4_meta, &h_Wk_nvfp4_meta, &h_Wv_nvfp4_meta,
+                            d_bq, d_bk, d_bv,
+                            d_output, batch, seq_len, d_model, d_k, d_v,
+                            false);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
+    }
+    elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
+
+    // Copy Full NVFP4 result back
+    CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
+
+    float time_nvfp4_full = elapsed_time_quant;
+    printf("Median execution time: %.4f ms\n", elapsed_time_quant);
+
+    printf("\n");
+
     // Cleanup CUDA events
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
@@ -989,6 +1103,7 @@ int main() {
     printf("%-20s | %12.4f | %12.4f | %12.4f\n", "Projection-Fused", time_mxfp4_projection, time_nf4_projection, time_nvfp4_projection);
     printf("%-20s | %12.4f | %12.4f | %12.4f\n", "Semi-Fused", time_mxfp4_semi, time_nf4_semi, time_nvfp4_semi);
     printf("%-20s | %12.4f | %12.4f | %12.4f\n", "Ours", time_mxfp4_ours, time_nf4_ours, time_nvfp4_ours);
+    printf("%-20s | %12.4f | %12.4f | %12.4f\n", "Full (Chunk-Tiled)", time_mxfp4_full, time_nf4_full, time_nvfp4_full);
     printf("======================================================================================\n");
 
 

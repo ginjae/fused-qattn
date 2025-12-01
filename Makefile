@@ -2,7 +2,7 @@ CHECK_TARGET = cuda_healthcheck
 CHECK_SRC    = cuda_healthcheck.cu
 
 EVAL_TARGET = eval
-EVAL_SRC    = src/eval.cu src/attn_naive.cu src/attn_tiled.cu src/attn_flash.cu src/attn_ours.cu src/quantization_utils.cu
+EVAL_SRC    = src/eval.cu src/attn_naive.cu src/attn_tiled.cu src/attn_flash.cu src/attn_ours.cu src/attn_full.cu src/quantization_utils.cu
 
 all: $(CHECK_TARGET) $(EVAL_TARGET)
 
