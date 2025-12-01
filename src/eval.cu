@@ -16,6 +16,7 @@
 
 #define NUM_ITERATIONS 100
 #define COOLDOWN_SECONDS 1  // seconds to wait between tests
+#define MAX_KERNELS 10  // Maximum number of kernels for any implementation
 
 
 void print_output_sample(const char* label, float* output, int seq_len, int d_v) {
