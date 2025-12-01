@@ -374,66 +374,72 @@ int main() {
 
     cooldown_gpu(COOLDOWN_SECONDS);
     printf("\n1. Naive Flash Attention (MXFP4)\n");
-    // Dummy run to warm up GPU
+    
+    // Measure kernel latency breakdown
+    float kernel_times_naive[10];
+    int num_kernels_naive = 0;
     naive_flash_attention_mxfp4(d_X, 
                                 d_Wq_mxfp4, d_Wk_mxfp4, d_Wv_mxfp4,
                                 d_bq, d_bk, d_bv,
                                 d_output, batch, seq_len, d_model, d_k, d_v,
-                                false);
+                                false, kernel_times_naive, &num_kernels_naive);
     CUDA_CHECK(cudaDeviceSynchronize());
-
-    // Run multiple iterations
-    printf("Running %d iterations...\n", NUM_ITERATIONS);
-    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
-        CUDA_CHECK(cudaEventRecord(start));
-        naive_flash_attention_mxfp4(d_X, 
-                                    d_Wq_mxfp4, d_Wk_mxfp4, d_Wv_mxfp4,
-                                    d_bq, d_bk, d_bv,
-                                    d_output, batch, seq_len, d_model, d_k, d_v,
-                                    false);
-        CUDA_CHECK(cudaEventRecord(stop));
-        CUDA_CHECK(cudaEventSynchronize(stop));
-        CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
-    }
-    elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
 
     // Copy MXFP4 result back
     CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
-    time_mxfp4_naive = elapsed_time_quant;
-    printf("Median execution time: %.4f ms\n", elapsed_time_quant);
+    
+    // Compute total time from kernel times
+    float total_time_naive = 0.0f;
+    for (int k = 0; k < num_kernels_naive; k++) {
+        total_time_naive += kernel_times_naive[k];
+    }
+    time_mxfp4_naive = total_time_naive;
+    
+    printf("Median execution time: %.4f ms\n", total_time_naive);
+    printf("\nKernel Latency Breakdown:\n");
+    printf("  1. Dequantize Wq:            %8.4f ms\n", kernel_times_naive[0]);
+    printf("  2. Dequantize Wk:            %8.4f ms\n", kernel_times_naive[1]);
+    printf("  3. Dequantize Wv:            %8.4f ms\n", kernel_times_naive[2]);
+    printf("  4. Linear Projection Q:      %8.4f ms\n", kernel_times_naive[3]);
+    printf("  5. Linear Projection K:      %8.4f ms\n", kernel_times_naive[4]);
+    printf("  6. Linear Projection V:      %8.4f ms\n", kernel_times_naive[5]);
+    printf("  7. Flash Attention:          %8.4f ms\n", kernel_times_naive[6]);
+    printf("  ----------------------------------------\n");
+    printf("  Total (sum):                 %8.4f ms\n", total_time_naive);
 
 
     cooldown_gpu(COOLDOWN_SECONDS);
     printf("\n2. Projection-Fused Flash Attention (MXFP4)\n");
-    // Dummy run to warm up GPU
-    printf("Running dummy run for warm-up...\n");
+    
+    // Measure kernel latency breakdown
+    float kernel_times_proj[10];
+    int num_kernels_proj = 0;
     flash_attention_mxfp4(d_X, 
                           d_Wq_mxfp4, d_Wk_mxfp4, d_Wv_mxfp4,
                           d_bq, d_bk, d_bv,
                           d_output, batch, seq_len, d_model, d_k, d_v,
-                          false);
+                          false, kernel_times_proj, &num_kernels_proj);
     CUDA_CHECK(cudaDeviceSynchronize());
-
-    // Run multiple iterations
-    printf("Running %d iterations...\n", NUM_ITERATIONS);
-    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
-        CUDA_CHECK(cudaEventRecord(start));
-        flash_attention_mxfp4(d_X, 
-                              d_Wq_mxfp4, d_Wk_mxfp4, d_Wv_mxfp4,
-                              d_bq, d_bk, d_bv,
-                              d_output, batch, seq_len, d_model, d_k, d_v,
-                              false);
-        CUDA_CHECK(cudaEventRecord(stop));
-        CUDA_CHECK(cudaEventSynchronize(stop));
-        CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
-    }
-    elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
 
     // Copy MXFP4 result back
     CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
-
-    time_mxfp4_projection = elapsed_time_quant;
-    printf("Median execution time: %.4f ms\n", elapsed_time_quant);
+    
+    // Compute total time
+    float total_time_proj = 0.0f;
+    for (int k = 0; k < num_kernels_proj; k++) {
+        total_time_proj += kernel_times_proj[k];
+    }
+    time_mxfp4_projection = total_time_proj;
+    
+    printf("Median execution time: %.4f ms\n", total_time_proj);
+    printf("\nKernel Latency Breakdown:\n");
+    printf("  1. Dequantize Wq:            %8.4f ms\n", kernel_times_proj[0]);
+    printf("  2. Dequantize Wk:            %8.4f ms\n", kernel_times_proj[1]);
+    printf("  3. Dequantize Wv:            %8.4f ms\n", kernel_times_proj[2]);
+    printf("  4. Fused QKV Projection:     %8.4f ms\n", kernel_times_proj[3]);
+    printf("  5. Flash Attention:          %8.4f ms\n", kernel_times_proj[4]);
+    printf("  ----------------------------------------\n");
+    printf("  Total (sum):                 %8.4f ms\n", total_time_proj);
     
     // // Compare with baseline (both MXFP4, should match closely)
     // compute_error_metrics("Tiled MXFP4 vs Naive MXFP4", h_naive_baseline_mxfp4, h_result_temp, 
@@ -442,35 +448,34 @@ int main() {
 
     cooldown_gpu(COOLDOWN_SECONDS);
     printf("\n3. Semi Fused Flash Attention (MXFP4)\n");
-    // Dummy run to warm up GPU
-    printf("Running dummy run for warm-up...\n");
+    
+    // Measure kernel latency breakdown
+    float kernel_times_semi[10];
+    int num_kernels_semi = 0;
     fused_flash_attention_mxfp4(d_X, 
                                 d_Wq_mxfp4, d_Wk_mxfp4, d_Wv_mxfp4,
                                 d_bq, d_bk, d_bv,
                                 d_output, batch, seq_len, d_model, d_k, d_v,
-                                false);
+                                false, kernel_times_semi, &num_kernels_semi);
     CUDA_CHECK(cudaDeviceSynchronize());
-
-    // Run multiple iterations
-    printf("Running %d iterations...\n", NUM_ITERATIONS);
-    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
-        CUDA_CHECK(cudaEventRecord(start));
-        fused_flash_attention_mxfp4(d_X, 
-                                    d_Wq_mxfp4, d_Wk_mxfp4, d_Wv_mxfp4,
-                                    d_bq, d_bk, d_bv,
-                                    d_output, batch, seq_len, d_model, d_k, d_v,
-                                    false);
-        CUDA_CHECK(cudaEventRecord(stop));
-        CUDA_CHECK(cudaEventSynchronize(stop));
-        CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
-    }
-    elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
 
     // Copy MXFP4 result back
     CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
 
-    time_mxfp4_semi = elapsed_time_quant;
-    printf("Median execution time: %.4f ms\n", elapsed_time_quant);
+    // Compute total time
+    float total_time_semi = 0.0f;
+    for (int k = 0; k < num_kernels_semi; k++) {
+        total_time_semi += kernel_times_semi[k];
+    }
+    time_mxfp4_semi = total_time_semi;
+    
+    printf("Median execution time: %.4f ms\n", total_time_semi);
+    printf("\nKernel Latency Breakdown:\n");
+    printf("  1. Fused QKV Dequant:        %8.4f ms\n", kernel_times_semi[0]);
+    printf("  2. Fused QKV Projection:     %8.4f ms\n", kernel_times_semi[1]);
+    printf("  3. Flash Attention:          %8.4f ms\n", kernel_times_semi[2]);
+    printf("  ----------------------------------------\n");
+    printf("  Total (sum):                 %8.4f ms\n", total_time_semi);
     
     // // Compare with baseline (both MXFP4, should match closely)
     // compute_error_metrics("Flash MXFP4 vs Naive MXFP4", h_naive_baseline_mxfp4, h_result_temp, 
@@ -479,34 +484,32 @@ int main() {
     cooldown_gpu(COOLDOWN_SECONDS);
     printf("\n4. Our Attention (MXFP4)\n");
 
-    printf("Running dummy run for warm-up...\n");
+    // Measure kernel latency breakdown
+    float kernel_times_ours[10];
+    int num_kernels_ours = 0;
     our_attention_mxfp4(d_X, 
-                          d_Wq_mxfp4, d_Wk_mxfp4, d_Wv_mxfp4,
-                          d_bq, d_bk, d_bv,
-                          d_output, batch, seq_len, d_model, d_k, d_v,
-                          false);
+                        d_Wq_mxfp4, d_Wk_mxfp4, d_Wv_mxfp4,
+                        d_bq, d_bk, d_bv,
+                        d_output, batch, seq_len, d_model, d_k, d_v,
+                        false, kernel_times_ours, &num_kernels_ours);
     CUDA_CHECK(cudaDeviceSynchronize());
-
-    // Run multiple iterations
-    printf("Running %d iterations...\n", NUM_ITERATIONS);
-    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
-        CUDA_CHECK(cudaEventRecord(start));
-        our_attention_mxfp4(d_X, 
-                              d_Wq_mxfp4, d_Wk_mxfp4, d_Wv_mxfp4,
-                              d_bq, d_bk, d_bv,
-                              d_output, batch, seq_len, d_model, d_k, d_v,
-                              false);
-        CUDA_CHECK(cudaEventRecord(stop));
-        CUDA_CHECK(cudaEventSynchronize(stop));
-        CUDA_CHECK(cudaEventElapsedTime(&iteration_times[iter], start, stop));
-    }
-    elapsed_time_quant = compute_median(iteration_times, NUM_ITERATIONS);
 
     // Copy MXFP4 result back
     CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
 
-    time_mxfp4_ours = elapsed_time_quant;
-    printf("Median execution time: %.4f ms\n", elapsed_time_quant);
+    // Compute total time
+    float total_time_ours = 0.0f;
+    for (int k = 0; k < num_kernels_ours; k++) {
+        total_time_ours += kernel_times_ours[k];
+    }
+    time_mxfp4_ours = total_time_ours;
+    
+    printf("Median execution time: %.4f ms\n", total_time_ours);
+    printf("\nKernel Latency Breakdown:\n");
+    printf("  1. Fused Dequant+Projection: %8.4f ms\n", kernel_times_ours[0]);
+    printf("  2. Our Attention Kernel:     %8.4f ms\n", kernel_times_ours[1]);
+    printf("  ----------------------------------------\n");
+    printf("  Total (sum):                 %8.4f ms\n", total_time_ours);
     
     // // Compare with baseline (both MXFP4, should match closely)
     // compute_error_metrics("Our MXFP4 vs Naive MXFP4", h_naive_baseline_mxfp4, h_result_temp, 
