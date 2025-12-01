@@ -546,6 +546,10 @@ int main() {
 
     float time_mxfp4_full = elapsed_time_quant;
     printf("Median execution time: %.4f ms\n", elapsed_time_quant);
+    
+    // Compare with baseline (both MXFP4, should match closely)
+    compute_error_metrics("Full MXFP4 vs Naive MXFP4", h_naive_baseline_mxfp4, h_result_temp, 
+                         batch, seq_len, d_v, UNQUANTIZED);
 
     printf("\n");
 
@@ -812,6 +816,10 @@ int main() {
 
     float time_nf4_full = elapsed_time_quant;
     printf("Median execution time: %.4f ms\n", elapsed_time_quant);
+    
+    // Compare with baseline (both NF4, should match closely)
+    compute_error_metrics("Full NF4 vs Naive NF4", h_naive_baseline_nf4, h_result_temp, 
+                         batch, seq_len, d_v, UNQUANTIZED);
 
     printf("\n");
 
@@ -1085,6 +1093,10 @@ int main() {
 
     float time_nvfp4_full = elapsed_time_quant;
     printf("Median execution time: %.4f ms\n", elapsed_time_quant);
+    
+    // Compare with baseline (both NVFP4, should match closely)
+    compute_error_metrics("Full NVFP4 vs Naive NVFP4", h_naive_baseline_nvfp4, h_result_temp, 
+                         batch, seq_len, d_v, UNQUANTIZED);
 
     printf("\n");
 
