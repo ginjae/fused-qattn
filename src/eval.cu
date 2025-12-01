@@ -132,7 +132,7 @@ void cooldown_gpu(int seconds) {
 int main() {
     // Test parameters (GPT-2 small scale)
     int batch = 1;
-    int seq_len = 128;
+    int seq_len = 1;
     int d_model = 768;
     int d_k = 64;
     int d_v = 64;
