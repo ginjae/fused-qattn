@@ -232,6 +232,18 @@ __global__ void fused_mxfp4_qkv_projection_kernel(
     int d_v
 );
 
+__global__ void fused_mxfp4_qkv_dequant_kernel(
+    const MXFP4Block* __restrict__ Wq_quantized,
+    const MXFP4Block* __restrict__ Wk_quantized,
+    const MXFP4Block* __restrict__ Wv_quantized,
+    float* __restrict__ Wq_out,
+    float* __restrict__ Wk_out,
+    float* __restrict__ Wv_out,
+    int d_model,
+    int d_k,
+    int d_v
+);
+
 // Fused NF4 Dequantization + QKV Projection Kernel
 __global__ void fused_nf4_qkv_projection_kernel(
     const float* __restrict__ X,
@@ -246,6 +258,18 @@ __global__ void fused_nf4_qkv_projection_kernel(
     float* __restrict__ V,
     int batch,
     int seq_len,
+    int d_model,
+    int d_k,
+    int d_v
+);
+
+__global__ void fused_nf4_qkv_dequant_kernel(
+    const NF4Block* __restrict__ Wq_quantized,
+    const NF4Block* __restrict__ Wk_quantized,
+    const NF4Block* __restrict__ Wv_quantized,
+    float* __restrict__ Wq_out,
+    float* __restrict__ Wk_out,
+    float* __restrict__ Wv_out,
     int d_model,
     int d_k,
     int d_v
@@ -268,6 +292,21 @@ __global__ void fused_nvfp4_qkv_projection_kernel(
     float* __restrict__ V,
     int batch,
     int seq_len,
+    int d_model,
+    int d_k,
+    int d_v
+);
+
+__global__ void fused_nvfp4_qkv_dequant_kernel(
+    const NVFP4Block* __restrict__ Wq_quantized,
+    const NVFP4Block* __restrict__ Wk_quantized,
+    const NVFP4Block* __restrict__ Wv_quantized,
+    float s_dec_global_q,
+    float s_dec_global_k,
+    float s_dec_global_v,
+    float* __restrict__ Wq_dequant,
+    float* __restrict__ Wk_dequant,
+    float* __restrict__ Wv_dequant,
     int d_model,
     int d_k,
     int d_v

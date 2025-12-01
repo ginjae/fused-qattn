@@ -1316,6 +1316,88 @@ __global__ void fused_nf4_qkv_projection_kernel(
 }
 
 // ============================================================================
+// Fused NF4 Dequantization Only (No Projection)
+// ============================================================================
+
+// Kernel: Fused NF4 Dequantization for Wq, Wk, Wv (No Projection)
+// Performs on-the-fly NF4 dequantization without matrix multiplication
+// Wq_quantized, Wk_quantized, Wv_quantized: NF4Block arrays
+// Wq_out, Wk_out, Wv_out: Dequantized weight matrices
+__global__ void fused_nf4_qkv_dequant_kernel(
+    const NF4Block* __restrict__ Wq_quantized,
+    const NF4Block* __restrict__ Wk_quantized,
+    const NF4Block* __restrict__ Wv_quantized,
+    float* __restrict__ Wq_out,
+    float* __restrict__ Wk_out,
+    float* __restrict__ Wv_out,
+    int d_model,
+    int d_k,
+    int d_v
+) {
+    // Each thread processes one element from each weight matrix
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Dequantize Wq
+    if (row < d_model && col < d_k) {
+        const int wq_idx = row * d_k + col;
+        const int block_idx = wq_idx / NF4_BLOCK_SIZE;
+        const int local_idx = wq_idx % NF4_BLOCK_SIZE;
+        
+        const float absmax = Wq_quantized[block_idx].absmax;
+        
+        // Unpack 4-bit value
+        uint8_t nf4_val;
+        if (local_idx % 2 == 0) {
+            nf4_val = (Wq_quantized[block_idx].data[local_idx / 2] >> 4) & 0xF;
+        } else {
+            nf4_val = Wq_quantized[block_idx].data[local_idx / 2] & 0xF;
+        }
+        
+        if (nf4_val >= 16) nf4_val = 15;
+        Wq_out[wq_idx] = NF4_QUANT_TABLE_GPU[nf4_val] * absmax;
+    }
+
+    // Dequantize Wk
+    if (row < d_model && col < d_k) {
+        const int wk_idx = row * d_k + col;
+        const int block_idx = wk_idx / NF4_BLOCK_SIZE;
+        const int local_idx = wk_idx % NF4_BLOCK_SIZE;
+        
+        const float absmax = Wk_quantized[block_idx].absmax;
+        
+        uint8_t nf4_val;
+        if (local_idx % 2 == 0) {
+            nf4_val = (Wk_quantized[block_idx].data[local_idx / 2] >> 4) & 0xF;
+        } else {
+            nf4_val = Wk_quantized[block_idx].data[local_idx / 2] & 0xF;
+        }
+        
+        if (nf4_val >= 16) nf4_val = 15;
+        Wk_out[wk_idx] = NF4_QUANT_TABLE_GPU[nf4_val] * absmax;
+    }
+
+    // Dequantize Wv
+    if (row < d_model && col < d_v) {
+        const int wv_idx = row * d_v + col;
+        const int block_idx = wv_idx / NF4_BLOCK_SIZE;
+        const int local_idx = wv_idx % NF4_BLOCK_SIZE;
+        
+        const float absmax = Wv_quantized[block_idx].absmax;
+        
+        uint8_t nf4_val;
+        if (local_idx % 2 == 0) {
+            nf4_val = (Wv_quantized[block_idx].data[local_idx / 2] >> 4) & 0xF;
+        } else {
+            nf4_val = Wv_quantized[block_idx].data[local_idx / 2] & 0xF;
+        }
+        
+        if (nf4_val >= 16) nf4_val = 15;
+        Wv_out[wv_idx] = NF4_QUANT_TABLE_GPU[nf4_val] * absmax;
+    }
+}
+
+// ============================================================================
 // Fused MXFP4 Dequantization + QKV Projection Kernel
 // ============================================================================
 
@@ -1464,6 +1546,85 @@ __global__ void fused_mxfp4_qkv_projection_kernel(
             sum_v += __ldg(&bv[col]);
         }
         V[b_idx * seq_len * d_v + row * d_v + col] = sum_v;
+    }
+}
+
+// ============================================================================
+// Fused MXFP4 Dequantization Only (No Projection)
+// ============================================================================
+
+// Kernel: Fused MXFP4 Dequantization for Wq, Wk, Wv (No Projection)
+// Performs on-the-fly MXFP4 dequantization without matrix multiplication
+// Wq_quantized, Wk_quantized, Wv_quantized: MXFP4Block arrays
+// Wq_out, Wk_out, Wv_out: Dequantized weight matrices
+__global__ void fused_mxfp4_qkv_dequant_kernel(
+    const MXFP4Block* __restrict__ Wq_quantized,
+    const MXFP4Block* __restrict__ Wk_quantized,
+    const MXFP4Block* __restrict__ Wv_quantized,
+    float* __restrict__ Wq_out,
+    float* __restrict__ Wk_out,
+    float* __restrict__ Wv_out,
+    int d_model,
+    int d_k,
+    int d_v
+) {
+    // Each thread processes one element from each weight matrix
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Dequantize Wq
+    if (row < d_model && col < d_k) {
+        const int wq_idx = row * d_k + col;
+        const int block_idx = wq_idx / MXFP4_BLOCK_SIZE;
+        const int local_idx = wq_idx % MXFP4_BLOCK_SIZE;
+        
+        const int shared_exp = (int)Wq_quantized[block_idx].shared_exp - 127;
+        
+        // Unpack 4-bit value
+        uint8_t fp4_val;
+        if (local_idx % 2 == 0) {
+            fp4_val = (Wq_quantized[block_idx].data[local_idx / 2] >> 4) & 0xF;
+        } else {
+            fp4_val = Wq_quantized[block_idx].data[local_idx / 2] & 0xF;
+        }
+        
+        Wq_out[wq_idx] = fp4_mantissa_to_float(fp4_val, shared_exp);
+    }
+
+    // Dequantize Wk
+    if (row < d_model && col < d_k) {
+        const int wk_idx = row * d_k + col;
+        const int block_idx = wk_idx / MXFP4_BLOCK_SIZE;
+        const int local_idx = wk_idx % MXFP4_BLOCK_SIZE;
+        
+        const int shared_exp = (int)Wk_quantized[block_idx].shared_exp - 127;
+        
+        uint8_t fp4_val;
+        if (local_idx % 2 == 0) {
+            fp4_val = (Wk_quantized[block_idx].data[local_idx / 2] >> 4) & 0xF;
+        } else {
+            fp4_val = Wk_quantized[block_idx].data[local_idx / 2] & 0xF;
+        }
+        
+        Wk_out[wk_idx] = fp4_mantissa_to_float(fp4_val, shared_exp);
+    }
+
+    // Dequantize Wv
+    if (row < d_model && col < d_v) {
+        const int wv_idx = row * d_v + col;
+        const int block_idx = wv_idx / MXFP4_BLOCK_SIZE;
+        const int local_idx = wv_idx % MXFP4_BLOCK_SIZE;
+        
+        const int shared_exp = (int)Wv_quantized[block_idx].shared_exp - 127;
+        
+        uint8_t fp4_val;
+        if (local_idx % 2 == 0) {
+            fp4_val = (Wv_quantized[block_idx].data[local_idx / 2] >> 4) & 0xF;
+        } else {
+            fp4_val = Wv_quantized[block_idx].data[local_idx / 2] & 0xF;
+        }
+        
+        Wv_out[wv_idx] = fp4_mantissa_to_float(fp4_val, shared_exp);
     }
 }
 
@@ -1627,5 +1788,90 @@ __global__ void fused_nvfp4_qkv_projection_kernel(
             sum_v += __ldg(&bv[col]);
         }
         V[b_idx * seq_len * d_v + row * d_v + col] = sum_v;
+    }
+}
+
+// ============================================================================
+// Fused NVFP4 Dequantization for QKV Weights (No Projection)
+// ============================================================================
+
+// Kernel: Fused NVFP4 Dequantization for QKV Weights (No Projection)
+// Only performs on-the-fly NVFP4 dequantization with 2-level scaling
+// Wq_quantized, Wk_quantized, Wv_quantized: NVFP4Block arrays
+// s_dec_global_q/k/v: per-tensor FP32 decode scales
+// Wq_dequant, Wk_dequant, Wv_dequant: Dequantized FP32 weight matrices
+__global__ void fused_nvfp4_qkv_dequant_kernel(
+    const NVFP4Block* __restrict__ Wq_quantized,
+    const NVFP4Block* __restrict__ Wk_quantized,
+    const NVFP4Block* __restrict__ Wv_quantized,
+    float s_dec_global_q,
+    float s_dec_global_k,
+    float s_dec_global_v,
+    float* __restrict__ Wq_dequant,
+    float* __restrict__ Wk_dequant,
+    float* __restrict__ Wv_dequant,
+    int d_model,
+    int d_k,
+    int d_v
+) {
+    // Each thread handles one element from each weight matrix
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_elements_qk = d_model * d_k;
+    const int total_elements_v = d_model * d_v;
+
+    // Dequantize Wq
+    if (idx < total_elements_qk) {
+        const int block_idx = idx / NVFP4_BLOCK_SIZE;
+        const int local_idx = idx % NVFP4_BLOCK_SIZE;
+        
+        // Get local E4M3 scale and apply 2-level scaling
+        const float s_dec_local_e4m3 = fp8_e4m3_to_float(Wq_quantized[block_idx].scale_e4m3);
+        const float combined_scale = s_dec_local_e4m3 * s_dec_global_q;
+        
+        // Unpack 4-bit value
+        uint8_t nvfp4_val;
+        if (local_idx % 2 == 0) {
+            nvfp4_val = (Wq_quantized[block_idx].data[local_idx / 2] >> 4) & 0xF;
+        } else {
+            nvfp4_val = Wq_quantized[block_idx].data[local_idx / 2] & 0xF;
+        }
+        
+        Wq_dequant[idx] = NVFP4_E2M1_TABLE_GPU[nvfp4_val] * combined_scale;
+    }
+
+    // Dequantize Wk
+    if (idx < total_elements_qk) {
+        const int block_idx = idx / NVFP4_BLOCK_SIZE;
+        const int local_idx = idx % NVFP4_BLOCK_SIZE;
+        
+        const float s_dec_local_e4m3 = fp8_e4m3_to_float(Wk_quantized[block_idx].scale_e4m3);
+        const float combined_scale = s_dec_local_e4m3 * s_dec_global_k;
+        
+        uint8_t nvfp4_val;
+        if (local_idx % 2 == 0) {
+            nvfp4_val = (Wk_quantized[block_idx].data[local_idx / 2] >> 4) & 0xF;
+        } else {
+            nvfp4_val = Wk_quantized[block_idx].data[local_idx / 2] & 0xF;
+        }
+        
+        Wk_dequant[idx] = NVFP4_E2M1_TABLE_GPU[nvfp4_val] * combined_scale;
+    }
+
+    // Dequantize Wv
+    if (idx < total_elements_v) {
+        const int block_idx = idx / NVFP4_BLOCK_SIZE;
+        const int local_idx = idx % NVFP4_BLOCK_SIZE;
+        
+        const float s_dec_local_e4m3 = fp8_e4m3_to_float(Wv_quantized[block_idx].scale_e4m3);
+        const float combined_scale = s_dec_local_e4m3 * s_dec_global_v;
+        
+        uint8_t nvfp4_val;
+        if (local_idx % 2 == 0) {
+            nvfp4_val = (Wv_quantized[block_idx].data[local_idx / 2] >> 4) & 0xF;
+        } else {
+            nvfp4_val = Wv_quantized[block_idx].data[local_idx / 2] & 0xF;
+        }
+        
+        Wv_dequant[idx] = NVFP4_E2M1_TABLE_GPU[nvfp4_val] * combined_scale;
     }
 }
