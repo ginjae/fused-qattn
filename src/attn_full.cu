@@ -6,6 +6,7 @@
 
 #define WARP_SIZE 32
 #define TILE_D 32  // Tile size for d_k/d_v dimension
+#define CHUNK_SIZE 32  // Chunk size for K/V tiling to reduce redundant computation
 
 // NF4 lookup table in constant memory (for GPU)
 __constant__ float NF4_TABLE_CONST[16] = {
@@ -116,10 +117,12 @@ __global__ void full_attention_blockwise_kernel(
     int warp_id = tid / WARP_SIZE;
     int lane_id = tid % WARP_SIZE;
     
-    // Shared memory
+    // Shared memory layout (optimized for chunk-based tiling)
     extern __shared__ float shared_mem[];
     float* q_row = shared_mem;  // Size: d_k
-    float* logits = shared_mem + d_k;  // Size: seq_len
+    int max_kv_size = (d_k > d_v ? d_k : d_v) * CHUNK_SIZE;
+    float* kv_tile = shared_mem + d_k;  // Size: max(d_k, d_v) * CHUNK_SIZE (reused for K and V)
+    float* logits = kv_tile + max_kv_size;  // Size: seq_len
     float* warp_maxes = logits + seq_len;  // Size: 32
     float* warp_sums = warp_maxes + 32;  // Size: 32
     
@@ -128,7 +131,6 @@ __global__ void full_attention_blockwise_kernel(
     int out_base = b * seq_len * d_v + row * d_v;
     
     // Step 1: Compute Q[row, :] = X[row, :] × Wq + bq
-    // Each thread computes part of q_row
     for (int k = tid; k < d_k; k += blockDim.x) {
         float sum = 0.0f;
         for (int d = 0; d < d_model; ++d) {
@@ -152,15 +154,20 @@ __global__ void full_attention_blockwise_kernel(
     }
     __syncthreads();
     
-    // Step 3: Compute QK^T for this row
-    // For each column, compute K[col, :] on-the-fly and dot with Q[row, :]
-    for (int col = tid; col < seq_len; col += blockDim.x) {
-        float dot_product = 0.0f;
-        int x_col_base = b * seq_len * d_model + col * d_model;
+    // Step 3: Compute QK^T using chunk-based tiling
+    // Process seq_len in chunks to reuse K computation
+    for (int chunk_start = 0; chunk_start < seq_len; chunk_start += CHUNK_SIZE) {
+        int chunk_end = (chunk_start + CHUNK_SIZE < seq_len) ? (chunk_start + CHUNK_SIZE) : seq_len;
+        int chunk_size = chunk_end - chunk_start;
         
-        // Compute K[col, :] on-the-fly and accumulate dot product
-        for (int k = 0; k < d_k; ++k) {
-            // Compute K[col, k] = X[col, :] × Wk[:, k] + bk[k]
+        // Phase 3.1: Cooperatively compute K tile for this chunk
+        // K_tile[chunk_idx, k] = X[chunk_start + chunk_idx, :] × Wk[:, k] + bk[k]
+        for (int idx = tid; idx < chunk_size * d_k; idx += blockDim.x) {
+            int chunk_idx = idx / d_k;
+            int k = idx % d_k;
+            int col = chunk_start + chunk_idx;
+            int x_col_base = b * seq_len * d_model + col * d_model;
+            
             float k_val = 0.0f;
             for (int d = 0; d < d_model; ++d) {
                 int w_idx = d * d_k + k;
@@ -173,15 +180,20 @@ __global__ void full_attention_blockwise_kernel(
                 
                 k_val += X[x_col_base + d] * w_dequant;
             }
-            k_val += bk[k];
-            
-            // Accumulate Q[row, k] · K[col, k]
-            dot_product += q_row[k] * k_val;
+            kv_tile[chunk_idx * d_k + k] = k_val + bk[k];
         }
+        __syncthreads();
         
-        logits[col] = dot_product * scale_factor;
+        // Phase 3.2: Compute Q · K_tile^T for this chunk
+        for (int chunk_idx = tid; chunk_idx < chunk_size; chunk_idx += blockDim.x) {
+            float dot_product = 0.0f;
+            for (int k = 0; k < d_k; ++k) {
+                dot_product += q_row[k] * kv_tile[chunk_idx * d_k + k];
+            }
+            logits[chunk_start + chunk_idx] = dot_product * scale_factor;
+        }
+        __syncthreads();
     }
-    __syncthreads();
     
     // Step 4: Apply causal mask and compute max for softmax
     float thread_max = -INFINITY;
@@ -261,21 +273,29 @@ __global__ void full_attention_blockwise_kernel(
     }
     __syncthreads();
     
-    // Step 7: Compute output = A × V
-    // For each output dimension, compute V on-the-fly and accumulate
+    // Step 7: Compute output = A × V using chunk-based tiling
+    // Initialize output to zero
     for (int v_dim = tid; v_dim < d_v; v_dim += blockDim.x) {
-        float acc = 0.0f;
+        output[out_base + v_dim] = 0.0f;
+    }
+    __syncthreads();
+    
+    // Process seq_len in chunks to reuse V computation
+    for (int chunk_start = 0; chunk_start < seq_len; chunk_start += CHUNK_SIZE) {
+        int chunk_end = (chunk_start + CHUNK_SIZE < seq_len) ? (chunk_start + CHUNK_SIZE) : seq_len;
+        int chunk_size = chunk_end - chunk_start;
         
-        for (int col = 0; col < seq_len; ++col) {
-            float attn_weight = logits[col];
-            if (attn_weight == 0.0f) continue;
-            
-            // Compute V[col, v_dim] on-the-fly
+        // Phase 7.1: Cooperatively compute V tile for this chunk
+        // V_tile[chunk_idx, v] = X[chunk_start + chunk_idx, :] × Wv[:, v] + bv[v]
+        for (int idx = tid; idx < chunk_size * d_v; idx += blockDim.x) {
+            int chunk_idx = idx / d_v;
+            int v = idx % d_v;
+            int col = chunk_start + chunk_idx;
             int x_col_base = b * seq_len * d_model + col * d_model;
-            float v_val = 0.0f;
             
+            float v_val = 0.0f;
             for (int d = 0; d < d_model; ++d) {
-                int w_idx = d * d_v + v_dim;
+                int w_idx = d * d_v + v;
                 int block_idx = w_idx / block_size;
                 
                 float scale = Wv_scales[block_idx];
@@ -285,12 +305,20 @@ __global__ void full_attention_blockwise_kernel(
                 
                 v_val += X[x_col_base + d] * w_dequant;
             }
-            v_val += bv[v_dim];
-            
-            acc += attn_weight * v_val;
+            kv_tile[chunk_idx * d_v + v] = v_val + bv[v];
         }
+        __syncthreads();
         
-        output[out_base + v_dim] = acc;
+        // Phase 7.2: Compute A[chunk] · V_tile and accumulate to output
+        for (int v_dim = tid; v_dim < d_v; v_dim += blockDim.x) {
+            float acc = 0.0f;
+            for (int chunk_idx = 0; chunk_idx < chunk_size; ++chunk_idx) {
+                float attn_weight = logits[chunk_start + chunk_idx];
+                acc += attn_weight * kv_tile[chunk_idx * d_v + v_dim];
+            }
+            output[out_base + v_dim] += acc;
+        }
+        __syncthreads();
     }
 }
 
@@ -320,7 +348,9 @@ void full_attention_quantized_blockwise(
     dim3 grid(seq_len, batch);
     dim3 block(256);
     
-    size_t shared_bytes = (d_k + seq_len + 64) * sizeof(float);
+    // Shared memory: q_row + kv_tile + logits + warp_reduction
+    int max_kv_size = (d_k > d_v ? d_k : d_v) * CHUNK_SIZE;
+    size_t shared_bytes = (d_k + max_kv_size + seq_len + 64) * sizeof(float);
     const float scale_factor = rsqrtf((float)d_k);
     
     full_attention_blockwise_kernel<<<grid, block, shared_bytes>>>(
@@ -368,7 +398,9 @@ __global__ void full_attention_mxfp4_kernel(
     
     extern __shared__ float shared_mem[];
     float* q_row = shared_mem;
-    float* logits = shared_mem + d_k;
+    int max_kv_size = (d_k > d_v ? d_k : d_v) * CHUNK_SIZE;
+    float* kv_tile = shared_mem + d_k;
+    float* logits = kv_tile + max_kv_size;
     float* warp_maxes = logits + seq_len;
     float* warp_sums = warp_maxes + 32;
     
@@ -404,12 +436,18 @@ __global__ void full_attention_mxfp4_kernel(
     }
     __syncthreads();
     
-    // Step 3: Compute QK^T
-    for (int col = tid; col < seq_len; col += blockDim.x) {
-        float dot_product = 0.0f;
-        int x_col_base = b * seq_len * d_model + col * d_model;
+    // Step 3: Compute QK^T using chunk-based tiling
+    for (int chunk_start = 0; chunk_start < seq_len; chunk_start += CHUNK_SIZE) {
+        int chunk_end = (chunk_start + CHUNK_SIZE < seq_len) ? (chunk_start + CHUNK_SIZE) : seq_len;
+        int chunk_size = chunk_end - chunk_start;
         
-        for (int k = 0; k < d_k; ++k) {
+        // Phase 3.1: Compute K tile
+        for (int idx = tid; idx < chunk_size * d_k; idx += blockDim.x) {
+            int chunk_idx = idx / d_k;
+            int k = idx % d_k;
+            int col = chunk_start + chunk_idx;
+            int x_col_base = b * seq_len * d_model + col * d_model;
+            
             float k_val = 0.0f;
             for (int d = 0; d < d_model; ++d) {
                 int w_idx = d * d_k + k;
@@ -427,13 +465,20 @@ __global__ void full_attention_mxfp4_kernel(
                 
                 k_val += X[x_col_base + d] * w_dequant;
             }
-            k_val += bk[k];
-            dot_product += q_row[k] * k_val;
+            kv_tile[chunk_idx * d_k + k] = k_val + bk[k];
         }
+        __syncthreads();
         
-        logits[col] = dot_product * scale_factor;
+        // Phase 3.2: Compute Q · K_tile^T
+        for (int chunk_idx = tid; chunk_idx < chunk_size; chunk_idx += blockDim.x) {
+            float dot_product = 0.0f;
+            for (int k = 0; k < d_k; ++k) {
+                dot_product += q_row[k] * kv_tile[chunk_idx * d_k + k];
+            }
+            logits[chunk_start + chunk_idx] = dot_product * scale_factor;
+        }
+        __syncthreads();
     }
-    __syncthreads();
     
     // Step 4: Softmax - max
     float thread_max = -INFINITY;
@@ -509,19 +554,26 @@ __global__ void full_attention_mxfp4_kernel(
     }
     __syncthreads();
     
-    // Step 7: Compute output = A × V
+    // Step 7: Compute output = A × V using chunk-based tiling
     for (int v_dim = tid; v_dim < d_v; v_dim += blockDim.x) {
-        float acc = 0.0f;
+        output[out_base + v_dim] = 0.0f;
+    }
+    __syncthreads();
+    
+    for (int chunk_start = 0; chunk_start < seq_len; chunk_start += CHUNK_SIZE) {
+        int chunk_end = (chunk_start + CHUNK_SIZE < seq_len) ? (chunk_start + CHUNK_SIZE) : seq_len;
+        int chunk_size = chunk_end - chunk_start;
         
-        for (int col = 0; col < seq_len; ++col) {
-            float attn_weight = logits[col];
-            if (attn_weight == 0.0f) continue;
-            
+        // Phase 7.1: Compute V tile
+        for (int idx = tid; idx < chunk_size * d_v; idx += blockDim.x) {
+            int chunk_idx = idx / d_v;
+            int v = idx % d_v;
+            int col = chunk_start + chunk_idx;
             int x_col_base = b * seq_len * d_model + col * d_model;
-            float v_val = 0.0f;
             
+            float v_val = 0.0f;
             for (int d = 0; d < d_model; ++d) {
-                int w_idx = d * d_v + v_dim;
+                int w_idx = d * d_v + v;
                 int block_idx = w_idx / MXFP4_BLOCK_SIZE;
                 int local_idx = w_idx % MXFP4_BLOCK_SIZE;
                 
@@ -536,12 +588,20 @@ __global__ void full_attention_mxfp4_kernel(
                 
                 v_val += X[x_col_base + d] * w_dequant;
             }
-            v_val += bv[v_dim];
-            
-            acc += attn_weight * v_val;
+            kv_tile[chunk_idx * d_v + v] = v_val + bv[v];
         }
+        __syncthreads();
         
-        output[out_base + v_dim] = acc;
+        // Phase 7.2: Compute A[chunk] · V_tile
+        for (int v_dim = tid; v_dim < d_v; v_dim += blockDim.x) {
+            float acc = 0.0f;
+            for (int chunk_idx = 0; chunk_idx < chunk_size; ++chunk_idx) {
+                float attn_weight = logits[chunk_start + chunk_idx];
+                acc += attn_weight * kv_tile[chunk_idx * d_v + v_dim];
+            }
+            output[out_base + v_dim] += acc;
+        }
+        __syncthreads();
     }
 }
 
@@ -568,7 +628,8 @@ void full_attention_mxfp4(
     dim3 grid(seq_len, batch);
     dim3 block(256);
     
-    size_t shared_bytes = (d_k + seq_len + 64) * sizeof(float);
+    int max_kv_size = (d_k > d_v ? d_k : d_v) * CHUNK_SIZE;
+    size_t shared_bytes = (d_k + max_kv_size + seq_len + 64) * sizeof(float);
     const float scale_factor = rsqrtf((float)d_k);
     
     full_attention_mxfp4_kernel<<<grid, block, shared_bytes>>>(
@@ -614,7 +675,9 @@ __global__ void full_attention_nf4_kernel(
     
     extern __shared__ float shared_mem[];
     float* q_row = shared_mem;
-    float* logits = shared_mem + d_k;
+    int max_kv_size = (d_k > d_v ? d_k : d_v) * CHUNK_SIZE;
+    float* kv_tile = shared_mem + d_k;
+    float* logits = kv_tile + max_kv_size;
     float* warp_maxes = logits + seq_len;
     float* warp_sums = warp_maxes + 32;
     
@@ -651,12 +714,18 @@ __global__ void full_attention_nf4_kernel(
     }
     __syncthreads();
     
-    // Step 3: Compute QK^T
-    for (int col = tid; col < seq_len; col += blockDim.x) {
-        float dot_product = 0.0f;
-        int x_col_base = b * seq_len * d_model + col * d_model;
+    // Step 3: Compute QK^T using chunk-based tiling
+    for (int chunk_start = 0; chunk_start < seq_len; chunk_start += CHUNK_SIZE) {
+        int chunk_end = (chunk_start + CHUNK_SIZE < seq_len) ? (chunk_start + CHUNK_SIZE) : seq_len;
+        int chunk_size = chunk_end - chunk_start;
         
-        for (int k = 0; k < d_k; ++k) {
+        // Phase 3.1: Compute K tile
+        for (int idx = tid; idx < chunk_size * d_k; idx += blockDim.x) {
+            int chunk_idx = idx / d_k;
+            int k = idx % d_k;
+            int col = chunk_start + chunk_idx;
+            int x_col_base = b * seq_len * d_model + col * d_model;
+            
             float k_val = 0.0f;
             for (int d = 0; d < d_model; ++d) {
                 int w_idx = d * d_k + k;
@@ -675,13 +744,20 @@ __global__ void full_attention_nf4_kernel(
                 
                 k_val += X[x_col_base + d] * w_dequant;
             }
-            k_val += bk[k];
-            dot_product += q_row[k] * k_val;
+            kv_tile[chunk_idx * d_k + k] = k_val + bk[k];
         }
+        __syncthreads();
         
-        logits[col] = dot_product * scale_factor;
+        // Phase 3.2: Compute Q · K_tile^T
+        for (int chunk_idx = tid; chunk_idx < chunk_size; chunk_idx += blockDim.x) {
+            float dot_product = 0.0f;
+            for (int k = 0; k < d_k; ++k) {
+                dot_product += q_row[k] * kv_tile[chunk_idx * d_k + k];
+            }
+            logits[chunk_start + chunk_idx] = dot_product * scale_factor;
+        }
+        __syncthreads();
     }
-    __syncthreads();
     
     // Step 4: Softmax - max
     float thread_max = -INFINITY;
@@ -757,19 +833,26 @@ __global__ void full_attention_nf4_kernel(
     }
     __syncthreads();
     
-    // Step 7: Compute output = A × V
+    // Step 7: Compute output = A × V using chunk-based tiling
     for (int v_dim = tid; v_dim < d_v; v_dim += blockDim.x) {
-        float acc = 0.0f;
+        output[out_base + v_dim] = 0.0f;
+    }
+    __syncthreads();
+    
+    for (int chunk_start = 0; chunk_start < seq_len; chunk_start += CHUNK_SIZE) {
+        int chunk_end = (chunk_start + CHUNK_SIZE < seq_len) ? (chunk_start + CHUNK_SIZE) : seq_len;
+        int chunk_size = chunk_end - chunk_start;
         
-        for (int col = 0; col < seq_len; ++col) {
-            float attn_weight = logits[col];
-            if (attn_weight == 0.0f) continue;
-            
+        // Phase 7.1: Compute V tile
+        for (int idx = tid; idx < chunk_size * d_v; idx += blockDim.x) {
+            int chunk_idx = idx / d_v;
+            int v = idx % d_v;
+            int col = chunk_start + chunk_idx;
             int x_col_base = b * seq_len * d_model + col * d_model;
-            float v_val = 0.0f;
             
+            float v_val = 0.0f;
             for (int d = 0; d < d_model; ++d) {
-                int w_idx = d * d_v + v_dim;
+                int w_idx = d * d_v + v;
                 int block_idx = w_idx / NF4_BLOCK_SIZE;
                 int local_idx = w_idx % NF4_BLOCK_SIZE;
                 
@@ -785,12 +868,20 @@ __global__ void full_attention_nf4_kernel(
                 
                 v_val += X[x_col_base + d] * w_dequant;
             }
-            v_val += bv[v_dim];
-            
-            acc += attn_weight * v_val;
+            kv_tile[chunk_idx * d_v + v] = v_val + bv[v];
         }
+        __syncthreads();
         
-        output[out_base + v_dim] = acc;
+        // Phase 7.2: Compute A[chunk] · V_tile
+        for (int v_dim = tid; v_dim < d_v; v_dim += blockDim.x) {
+            float acc = 0.0f;
+            for (int chunk_idx = 0; chunk_idx < chunk_size; ++chunk_idx) {
+                float attn_weight = logits[chunk_start + chunk_idx];
+                acc += attn_weight * kv_tile[chunk_idx * d_v + v_dim];
+            }
+            output[out_base + v_dim] += acc;
+        }
+        __syncthreads();
     }
 }
 
@@ -817,7 +908,8 @@ void full_attention_nf4(
     dim3 grid(seq_len, batch);
     dim3 block(256);
     
-    size_t shared_bytes = (d_k + seq_len + 64) * sizeof(float);
+    int max_kv_size = (d_k > d_v ? d_k : d_v) * CHUNK_SIZE;
+    size_t shared_bytes = (d_k + max_kv_size + seq_len + 64) * sizeof(float);
     const float scale_factor = rsqrtf((float)d_k);
     
     full_attention_nf4_kernel<<<grid, block, shared_bytes>>>(
@@ -866,7 +958,9 @@ __global__ void full_attention_nvfp4_kernel(
     
     extern __shared__ float shared_mem[];
     float* q_row = shared_mem;
-    float* logits = shared_mem + d_k;
+    int max_kv_size = (d_k > d_v ? d_k : d_v) * CHUNK_SIZE;
+    float* kv_tile = shared_mem + d_k;
+    float* logits = kv_tile + max_kv_size;
     float* warp_maxes = logits + seq_len;
     float* warp_sums = warp_maxes + 32;
     
@@ -905,12 +999,18 @@ __global__ void full_attention_nvfp4_kernel(
     }
     __syncthreads();
     
-    // Step 3: Compute QK^T
-    for (int col = tid; col < seq_len; col += blockDim.x) {
-        float dot_product = 0.0f;
-        int x_col_base = b * seq_len * d_model + col * d_model;
+    // Step 3: Compute QK^T using chunk-based tiling
+    for (int chunk_start = 0; chunk_start < seq_len; chunk_start += CHUNK_SIZE) {
+        int chunk_end = (chunk_start + CHUNK_SIZE < seq_len) ? (chunk_start + CHUNK_SIZE) : seq_len;
+        int chunk_size = chunk_end - chunk_start;
         
-        for (int k = 0; k < d_k; ++k) {
+        // Phase 3.1: Compute K tile
+        for (int idx = tid; idx < chunk_size * d_k; idx += blockDim.x) {
+            int chunk_idx = idx / d_k;
+            int k = idx % d_k;
+            int col = chunk_start + chunk_idx;
+            int x_col_base = b * seq_len * d_model + col * d_model;
+            
             float k_val = 0.0f;
             for (int d = 0; d < d_model; ++d) {
                 int w_idx = d * d_k + k;
@@ -931,13 +1031,20 @@ __global__ void full_attention_nvfp4_kernel(
                 
                 k_val += X[x_col_base + d] * w_dequant;
             }
-            k_val += bk[k];
-            dot_product += q_row[k] * k_val;
+            kv_tile[chunk_idx * d_k + k] = k_val + bk[k];
         }
+        __syncthreads();
         
-        logits[col] = dot_product * scale_factor;
+        // Phase 3.2: Compute Q · K_tile^T
+        for (int chunk_idx = tid; chunk_idx < chunk_size; chunk_idx += blockDim.x) {
+            float dot_product = 0.0f;
+            for (int k = 0; k < d_k; ++k) {
+                dot_product += q_row[k] * kv_tile[chunk_idx * d_k + k];
+            }
+            logits[chunk_start + chunk_idx] = dot_product * scale_factor;
+        }
+        __syncthreads();
     }
-    __syncthreads();
     
     // Step 4: Softmax - max
     float thread_max = -INFINITY;
@@ -1013,19 +1120,26 @@ __global__ void full_attention_nvfp4_kernel(
     }
     __syncthreads();
     
-    // Step 7: Compute output = A × V
+    // Step 7: Compute output = A × V using chunk-based tiling
     for (int v_dim = tid; v_dim < d_v; v_dim += blockDim.x) {
-        float acc = 0.0f;
+        output[out_base + v_dim] = 0.0f;
+    }
+    __syncthreads();
+    
+    for (int chunk_start = 0; chunk_start < seq_len; chunk_start += CHUNK_SIZE) {
+        int chunk_end = (chunk_start + CHUNK_SIZE < seq_len) ? (chunk_start + CHUNK_SIZE) : seq_len;
+        int chunk_size = chunk_end - chunk_start;
         
-        for (int col = 0; col < seq_len; ++col) {
-            float attn_weight = logits[col];
-            if (attn_weight == 0.0f) continue;
-            
+        // Phase 7.1: Compute V tile
+        for (int idx = tid; idx < chunk_size * d_v; idx += blockDim.x) {
+            int chunk_idx = idx / d_v;
+            int v = idx % d_v;
+            int col = chunk_start + chunk_idx;
             int x_col_base = b * seq_len * d_model + col * d_model;
-            float v_val = 0.0f;
             
+            float v_val = 0.0f;
             for (int d = 0; d < d_model; ++d) {
-                int w_idx = d * d_v + v_dim;
+                int w_idx = d * d_v + v;
                 int block_idx = w_idx / NVFP4_BLOCK_SIZE;
                 int local_idx = w_idx % NVFP4_BLOCK_SIZE;
                 
@@ -1043,12 +1157,20 @@ __global__ void full_attention_nvfp4_kernel(
                 
                 v_val += X[x_col_base + d] * w_dequant;
             }
-            v_val += bv[v_dim];
-            
-            acc += attn_weight * v_val;
+            kv_tile[chunk_idx * d_v + v] = v_val + bv[v];
         }
+        __syncthreads();
         
-        output[out_base + v_dim] = acc;
+        // Phase 7.2: Compute A[chunk] · V_tile
+        for (int v_dim = tid; v_dim < d_v; v_dim += blockDim.x) {
+            float acc = 0.0f;
+            for (int chunk_idx = 0; chunk_idx < chunk_size; ++chunk_idx) {
+                float attn_weight = logits[chunk_start + chunk_idx];
+                acc += attn_weight * kv_tile[chunk_idx * d_v + v_dim];
+            }
+            output[out_base + v_dim] += acc;
+        }
+        __syncthreads();
     }
 }
 
@@ -1078,7 +1200,8 @@ void full_attention_nvfp4(
     dim3 grid(seq_len, batch);
     dim3 block(256);
     
-    size_t shared_bytes = (d_k + seq_len + 64) * sizeof(float);
+    int max_kv_size = (d_k > d_v ? d_k : d_v) * CHUNK_SIZE;
+    size_t shared_bytes = (d_k + max_kv_size + seq_len + 64) * sizeof(float);
     const float scale_factor = rsqrtf((float)d_k);
     
     full_attention_nvfp4_kernel<<<grid, block, shared_bytes>>>(
