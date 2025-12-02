@@ -20,6 +20,9 @@ def visualize_latency_breakdown(csv_path):
     else:
         gpu_name = "Unknown GPU"
     
+    # First, generate performance comparison graph
+    visualize_performance_from_latency(df, csv_path, gpu_name)
+    
     # Get unique quantization types and implementations
     quant_types = df['Quantization'].unique()
     
@@ -49,7 +52,7 @@ def visualize_latency_breakdown(csv_path):
             kernel_lower = kernel_name.lower().replace(' ', '_')
             # Normalize attention kernel names
             if 'attention' in kernel_lower or 'flash' in kernel_lower:
-                return 'Attention'
+                return 'FlashAttention'
             # Normalize other common variations
             kernel_name = kernel_name.replace(' ', '_')
             return kernel_name
@@ -149,12 +152,16 @@ def visualize_latency_breakdown(csv_path):
                    ha='center', va='bottom', fontsize=9, fontweight='bold',
                    bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7))
         
-        ax.set_xlabel('Implementation', fontsize=11, fontweight='bold')
+        ax.set_xlabel('Flash Attention Implementation', fontsize=11, fontweight='bold')
         ax.set_ylabel('Execution Time (ms)', fontsize=11, fontweight='bold')
         ax.set_title(f'{quant_type}', fontsize=13, fontweight='bold')
         ax.set_xticks(x_pos)
-        ax.set_xticklabels(implementations, rotation=15, ha='right')
-        ax.legend(all_patches, all_labels, loc='upper left', fontsize=8, bbox_to_anchor=(1.02, 1))
+        # Replace underscores with spaces in x-axis labels
+        ax.set_xticklabels([impl.replace('_', ' ') for impl in implementations], rotation=15, ha='right')
+        # Replace underscores with spaces in legend labels - only show on rightmost subplot
+        if idx == n_quants - 1:
+            all_labels_display = [label.replace('_', ' ') for label in all_labels]
+            ax.legend(all_patches, all_labels_display, loc='upper left', fontsize=8, bbox_to_anchor=(1.02, 1))
         ax.grid(axis='y', alpha=0.3)
     
     plt.tight_layout()
@@ -165,6 +172,92 @@ def visualize_latency_breakdown(csv_path):
     print(f"Visualization saved to: {output_path}")
     
     # Show plot
+    plt.show()
+
+def visualize_performance_from_latency(df, csv_path, gpu_name):
+    """Generate performance comparison graph from latency breakdown data"""
+    
+    # Calculate total time per implementation and quantization type
+    perf_data = df.groupby(['Quantization', 'Implementation'])['Time_ms'].sum().reset_index()
+    
+    # Pivot to get implementations as rows and quantization types as columns
+    perf_pivot = perf_data.pivot(index='Implementation', columns='Quantization', values='Time_ms')
+    
+    # Preserve original order from CSV
+    implementations = df['Implementation'].unique()
+    quant_types = df['Quantization'].unique()
+    
+    # Reindex to maintain original order
+    perf_pivot = perf_pivot.reindex(index=implementations, columns=quant_types)
+    
+    # Set up the plot style
+    plt.style.use('seaborn-v0_8-darkgrid')
+    colors = plt.cm.tab10(np.linspace(0, 1, 10))
+    
+    # Create figure
+    fig, ax = plt.subplots(1, 1, figsize=(12, 6))
+    fig.suptitle(f'Performance Comparison - {gpu_name}', 
+                 fontsize=16, fontweight='bold')
+    
+    width = 0.8 / len(implementations)
+    
+    # Get baseline (first implementation) times for speedup calculation
+    baseline_times = perf_pivot.iloc[0].values
+    
+    # Grouped bar chart
+    for i, impl in enumerate(implementations):
+        values = perf_pivot.loc[impl].values
+        x_pos = np.arange(len(quant_types)) + i * width
+        # Add " Flash Attention" to legend label
+        label_text = f"{impl.replace('_', ' ')} Flash Attention" if impl != "Ours" else impl
+        bars = ax.bar(x_pos, values, width, label=label_text, color=colors[i])
+        
+        # Add value labels and speedup on bars
+        for j, (bar, val) in enumerate(zip(bars, values)):
+            if not np.isnan(val):
+                height = bar.get_height()
+                
+                # Show speedup (except for first baseline)
+                if i > 0 and not np.isnan(baseline_times[j]):
+                    speedup = baseline_times[j] / val
+                    # label_text = f'{speedup:.2f}×\n{val:.3f}ms'
+                    label_text = f'{val:.3f}ms'
+                    text_color = 'black'
+                    # text_color = 'darkgreen' if speedup > 1 else 'darkred'
+                else:
+                    # Just show execution time for baseline
+                    label_text = f'{val:.3f}ms'
+                    text_color = 'black'
+                
+                ax.text(bar.get_x() + bar.get_width()/2., height,
+                        label_text,
+                        ha='center', va='bottom', fontsize=8, fontweight='bold',
+                        linespacing=0.8, color=text_color)
+    
+    ax.set_xlabel('Quantization Type', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Total Execution Time (ms)', fontsize=12, fontweight='bold')
+    ax.set_title('Total Execution Time by Quantization Type', fontsize=14, fontweight='bold')
+    ax.set_xticks(np.arange(len(quant_types)) + width * (len(implementations) - 1) / 2)
+    ax.set_xticklabels(quant_types)
+    ax.grid(axis='y', alpha=0.3)
+    
+    # Increase y-axis limit to make room for legend
+    y_max = ax.get_ylim()[1]
+    ax.set_ylim(0, y_max * 1.15)
+    
+    legend = ax.legend(loc='upper right', fontsize=10, frameon=True, fancybox=True, shadow=True)
+    legend.get_frame().set_facecolor('white')
+    legend.get_frame().set_alpha(0.95)
+    legend.get_frame().set_edgecolor('gray')
+    legend.set_zorder(100)
+    
+    plt.tight_layout()
+    
+    # Save figure
+    output_path = csv_path.replace('latency_breakdown_', 'performance_').replace('.csv', '.png')
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"Performance graph saved to: {output_path}")
+    
     plt.show()
 
 def visualize_performance(csv_path):
