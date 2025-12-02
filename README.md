@@ -151,10 +151,10 @@ There are two kernel functions, each of which is for:
 # Evaluation
 
 ## Main Result
-![3090_result](results/performance_NVIDIA_GeForce_RTX_3090_20251202_162250.png)
+![3090_result](results/performance_NVIDIA_GeForce_RTX_3090_20251202_164332.png)
 
 ## Latency Breakdown
-![3090_latency](results/kernel_latency_breakdown_NVIDIA_GeForce_RTX_3090_20251202_162229.png)
+![3090_latency](results/kernel_latency_breakdown_NVIDIA_GeForce_RTX_3090_20251202_164312.png)
 
 
 ## 🤝 Contributors

@@ -1,0 +1,6 @@
+Implementation,MXFP4_ms,NF4_ms,NVFP4_ms
+Naive,0.1464,0.1444,0.1454
+Projection-Fused,0.1382,0.1300,0.1434
+Semi-Fused,0.1311,0.1280,0.1321
+Ours,0.1167,0.1203,0.1464
+Full,7.7594,10.4960,16.8463
