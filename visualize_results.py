@@ -6,6 +6,167 @@ import sys
 import os
 from pathlib import Path
 
+def visualize_latency_breakdown(csv_path):
+    """Visualize kernel latency breakdown from CSV file"""
+    
+    # Read CSV file
+    df = pd.read_csv(csv_path)
+    
+    # Extract GPU name and timestamp from filename
+    filename = Path(csv_path).stem
+    parts = filename.split('_')
+    if len(parts) >= 4:
+        gpu_name = ' '.join(parts[3:-2]).replace('_', ' ')
+    else:
+        gpu_name = "Unknown GPU"
+    
+    # Get unique quantization types and implementations
+    quant_types = df['Quantization'].unique()
+    
+    # Set up the plot style
+    plt.style.use('seaborn-v0_8-darkgrid')
+    
+    # Create subplots for each quantization type
+    n_quants = len(quant_types)
+    fig, axes = plt.subplots(1, n_quants, figsize=(6*n_quants, 6))
+    if n_quants == 1:
+        axes = [axes]
+    
+    fig.suptitle(f'Kernel Latency Breakdown - {gpu_name}', 
+                 fontsize=16, fontweight='bold')
+    
+    for idx, quant_type in enumerate(quant_types):
+        ax = axes[idx]
+        
+        # Filter data for this quantization type
+        quant_df = df[df['Quantization'] == quant_type].copy()
+        
+        # Get unique implementations
+        implementations = quant_df['Implementation'].unique()
+        
+        # Normalize kernel names for consistent grouping
+        def normalize_kernel_name(kernel_name):
+            kernel_lower = kernel_name.lower().replace(' ', '_')
+            # Normalize attention kernel names
+            if 'attention' in kernel_lower or 'flash' in kernel_lower:
+                return 'Attention'
+            # Normalize other common variations
+            kernel_name = kernel_name.replace(' ', '_')
+            return kernel_name
+        
+        # Prepare data for stacked bar chart
+        impl_data = {}
+        for impl in implementations:
+            impl_df = quant_df[quant_df['Implementation'] == impl]
+            # Normalize kernel names
+            normalized_kernels = [normalize_kernel_name(k) for k in impl_df['Kernel'].values]
+            impl_data[impl] = {
+                'kernels': np.array(normalized_kernels),
+                'times': impl_df['Time_ms'].values
+            }
+        
+        # Create stacked bar chart
+        x_pos = np.arange(len(implementations))
+        
+        # Assign colors based on kernel category and Q/K/V
+        def get_kernel_color(kernel_name):
+            kernel_lower = kernel_name.lower()
+            
+            # Check if it's a fused kernel
+            is_fused = kernel_name.startswith('Fused_')
+            
+            # Check for Q/K/V suffix
+            qkv_suffix = None
+            if '_q' in kernel_lower or 'wq' in kernel_lower:
+                qkv_suffix = 'q'
+            elif '_k' in kernel_lower or 'wk' in kernel_lower:
+                qkv_suffix = 'k'
+            elif '_v' in kernel_lower or 'wv' in kernel_lower:
+                qkv_suffix = 'v'
+            
+            # Determine category and get base color
+            if 'dequant' in kernel_lower:
+                if is_fused and kernel_lower.startswith('fused_dequant'):
+                    return '#CC00CC'  # Purple for fused dequant+projection
+                # Red tones for dequantization
+                elif is_fused:
+                    return '#CC0000'  # Dark red for fused
+                elif qkv_suffix == 'q':
+                    return '#FF6B6B'  # Bright red
+                elif qkv_suffix == 'k':
+                    return '#FF8E8E'  # Medium red
+                elif qkv_suffix == 'v':
+                    return '#FFB1B1'  # Light red
+                else:
+                    return '#FF6B6B'  # Default red
+            elif 'projection' in kernel_lower or 'linear' in kernel_lower:
+                # Teal tones for projection
+                if is_fused:
+                    return '#2A9D8F'  # Dark teal for fused
+                elif qkv_suffix == 'q':
+                    return '#4ECDC4'  # Bright teal
+                elif qkv_suffix == 'k':
+                    return '#6FD9D0'  # Medium teal
+                elif qkv_suffix == 'v':
+                    return '#90E5DC'  # Light teal
+                else:
+                    return '#4ECDC4'  # Default teal
+            elif 'attention' in kernel_lower or 'flash' in kernel_lower:
+                return '#FFA726'  # Orange
+            else:
+                return '#A8A8A8'  # Gray
+        
+        # Plot stacked bars - each implementation has its own stack in original order
+        all_patches = []
+        all_labels = []
+        
+        for i, impl in enumerate(implementations):
+            kernels = impl_data[impl]['kernels']
+            times = impl_data[impl]['times']
+            bottom = 0
+            
+            for kernel, time in zip(kernels, times):
+                color = get_kernel_color(kernel)
+                bar = ax.bar(x_pos[i], time, bottom=bottom, 
+                           color=color, width=0.6, edgecolor='white', linewidth=0.5)
+                
+                # Store for legend (avoid duplicates)
+                if kernel not in all_labels:
+                    all_patches.append(bar[0])
+                    all_labels.append(kernel)
+                
+                # Add time labels on bars (only if significant)
+                if time > 0.005:  # Only show if > 0.005ms
+                    y_pos = bottom + time / 2
+                    ax.text(x_pos[i], y_pos,
+                           f'{time:.3f}',
+                           ha='center', va='center', fontsize=7, fontweight='bold')
+                
+                bottom += time
+            
+            # Add total time on top of each bar
+            ax.text(x_pos[i], bottom, f'{bottom:.3f}ms',
+                   ha='center', va='bottom', fontsize=9, fontweight='bold',
+                   bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7))
+        
+        ax.set_xlabel('Implementation', fontsize=11, fontweight='bold')
+        ax.set_ylabel('Execution Time (ms)', fontsize=11, fontweight='bold')
+        ax.set_title(f'{quant_type}', fontsize=13, fontweight='bold')
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(implementations, rotation=15, ha='right')
+        ax.legend(all_patches, all_labels, loc='upper left', fontsize=8, bbox_to_anchor=(1.02, 1))
+        ax.grid(axis='y', alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save figure
+    output_path = csv_path.replace('.csv', '.png')
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"Visualization saved to: {output_path}")
+    
+    # Show plot
+    plt.show()
+
 def visualize_performance(csv_path):
     """Visualize performance results from CSV file"""
     
@@ -99,7 +260,7 @@ if __name__ == "__main__":
     else:
         # Find the most recent CSV file in results directory
         results_dir = Path(__file__).parent / "results"
-        csv_files = list(results_dir.glob("performance_*.csv"))
+        csv_files = list(results_dir.glob("*.csv"))
         if not csv_files:
             print("Error: No CSV files found in results/ directory")
             sys.exit(1)
@@ -110,4 +271,8 @@ if __name__ == "__main__":
         print(f"Error: CSV file not found: {csv_path}")
         sys.exit(1)
     
-    visualize_performance(csv_path)
+    # Determine which visualization to use based on filename
+    if "latency_breakdown" in csv_path:
+        visualize_latency_breakdown(csv_path)
+    else:
+        visualize_performance(csv_path)

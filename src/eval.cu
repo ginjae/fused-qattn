@@ -129,6 +129,19 @@ void cooldown_gpu(int seconds) {
     sleep(seconds);
 }
 
+// Function to save kernel latency breakdown to CSV
+void save_kernel_latency_to_csv(FILE* csv_file, const char* quantization_type, 
+                                 const char* implementation, float* kernel_times, 
+                                 int num_kernels, const char** kernel_names) {
+    if (csv_file == NULL) return;
+    
+    for (int i = 0; i < num_kernels; i++) {
+        fprintf(csv_file, "%s,%s,%s,%.4f\n", 
+                quantization_type, implementation, kernel_names[i], kernel_times[i]);
+    }
+    fflush(csv_file);
+}
+
 
 int main() {
     // Test parameters (GPT-2 small scale)
@@ -139,6 +152,37 @@ int main() {
     int d_v = 64;
 
     printf("\n=== Starting Evaluation (GPT-2 Scale, Using Real GPT-2 Weights) ===\n");
+
+    // Create CSV file for kernel latency breakdown
+    char csv_filename[512];
+    time_t now = time(NULL);
+    struct tm* t = localtime(&now);
+    
+    // Get GPU name
+    cudaDeviceProp deviceProp;
+    CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, 0));
+    
+    // Create results directory if it doesn't exist
+    mkdir("results", 0755);
+    
+    snprintf(csv_filename, sizeof(csv_filename), 
+             "results/kernel_latency_breakdown_%s_%04d%02d%02d_%02d%02d%02d.csv",
+             deviceProp.name, 
+             t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+             t->tm_hour, t->tm_min, t->tm_sec);
+    
+    // Replace spaces in filename with underscores
+    for (char* p = csv_filename; *p; p++) {
+        if (*p == ' ') *p = '_';
+    }
+    
+    FILE* csv_file = fopen(csv_filename, "w");
+    if (csv_file == NULL) {
+        printf("Warning: Could not create CSV file %s\n", csv_filename);
+    } else {
+        fprintf(csv_file, "Quantization,Implementation,Kernel,Time_ms\n");
+        printf("Saving kernel latency breakdown to: %s\n", csv_filename);
+    }
 
     printf("\n== Loading GPT-2 Weights ==\n");
     
@@ -423,6 +467,17 @@ int main() {
     for (int k = 0; k < num_kernels_naive; k++) total_time_naive += kernel_times_naive[k];
     printf("  Total (sum):                 %8.4f ms\n", total_time_naive);
 
+    // Save to CSV
+    const char* kernel_names_naive[] = {
+        "Dequantize_Wq", "Dequantize_Wk", "Dequantize_Wv",
+        "Linear_Projection_Q", "Linear_Projection_K", "Linear_Projection_V",
+        "Flash_Attention"
+    };
+    save_kernel_latency_to_csv(csv_file, "MXFP4", "Naive", 
+                                kernel_times_naive, num_kernels_naive, kernel_names_naive);
+
+    // Copy result back as MXFP4 baseline
+    CUDA_CHECK(cudaMemcpy(h_naive_baseline_mxfp4, d_output, out_size, cudaMemcpyDeviceToHost));
 
     cooldown_gpu(COOLDOWN_SECONDS);
     printf("\n2. Projection-Fused Flash Attention (MXFP4)\n");
@@ -471,10 +526,17 @@ int main() {
     float total_time_proj = 0.0f;
     for (int k = 0; k < num_kernels_proj; k++) total_time_proj += kernel_times_proj[k];
     printf("  Total (sum):                 %8.4f ms\n", total_time_proj);
+
+    const char* kernel_names_proj[] = {
+        "Dequantize_Wq", "Dequantize_Wk", "Dequantize_Wv",
+        "Fused_QKV_Projection", "Flash_Attention"
+    };
+    save_kernel_latency_to_csv(csv_file, "MXFP4", "Projection_Fused", 
+                                kernel_times_proj, num_kernels_proj, kernel_names_proj);
     
-    // // Compare with baseline (both MXFP4, should match closely)
-    // compute_error_metrics("Tiled MXFP4 vs Naive MXFP4", h_naive_baseline_mxfp4, h_result_temp, 
-    //                      batch, seq_len, d_v, UNQUANTIZED);
+    // Compare with baseline (both MXFP4, should match closely)
+    compute_error_metrics("Projection Fused MXFP4 vs Naive MXFP4", h_naive_baseline_mxfp4, h_result_temp, 
+                         batch, seq_len, d_v, UNQUANTIZED);
 
 
     cooldown_gpu(COOLDOWN_SECONDS);
@@ -522,10 +584,16 @@ int main() {
     float total_time_semi = 0.0f;
     for (int k = 0; k < num_kernels_semi; k++) total_time_semi += kernel_times_semi[k];
     printf("  Total (sum):                 %8.4f ms\n", total_time_semi);
+
+    const char* kernel_names_semi[] = {
+        "Fused_QKV_Dequant", "Fused_QKV_Projection", "Flash_Attention"
+    };
+    save_kernel_latency_to_csv(csv_file, "MXFP4", "Semi_Fused", 
+                                kernel_times_semi, num_kernels_semi, kernel_names_semi);
     
-    // // Compare with baseline (both MXFP4, should match closely)
-    // compute_error_metrics("Flash MXFP4 vs Naive MXFP4", h_naive_baseline_mxfp4, h_result_temp, 
-    //                      batch, seq_len, d_v, UNQUANTIZED);
+    // Compare with baseline (both MXFP4, should match closely)
+    compute_error_metrics("Semi Fused MXFP4 vs Naive MXFP4", h_naive_baseline_mxfp4, h_result_temp, 
+                         batch, seq_len, d_v, UNQUANTIZED);
 
     cooldown_gpu(COOLDOWN_SECONDS);
     printf("\n4. Our Attention (MXFP4)\n");
@@ -571,10 +639,16 @@ int main() {
     float total_time_ours = 0.0f;
     for (int k = 0; k < num_kernels_ours; k++) total_time_ours += kernel_times_ours[k];
     printf("  Total (sum):                 %8.4f ms\n", total_time_ours);
+
+    const char* kernel_names_ours[] = {
+        "Fused_Dequant_Projection", "Our_Attention_Kernel"
+    };
+    save_kernel_latency_to_csv(csv_file, "MXFP4", "Ours", 
+                                kernel_times_ours, num_kernels_ours, kernel_names_ours);
     
-    // // Compare with baseline (both MXFP4, should match closely)
-    // compute_error_metrics("Our MXFP4 vs Naive MXFP4", h_naive_baseline_mxfp4, h_result_temp, 
-    //                      batch, seq_len, d_v, UNQUANTIZED);
+    // Compare with baseline (both MXFP4, should match closely)
+    compute_error_metrics("Our MXFP4 vs Naive MXFP4", h_naive_baseline_mxfp4, h_result_temp, 
+                         batch, seq_len, d_v, UNQUANTIZED);
 
     printf("\n");
 
@@ -612,8 +686,8 @@ int main() {
     printf("Median execution time: %.4f ms\n", elapsed_time_quant);
     
     // Compare with baseline (both MXFP4, should match closely)
-    // compute_error_metrics("Full MXFP4 vs Naive MXFP4", h_naive_baseline_mxfp4, h_result_temp, 
-    //                      batch, seq_len, d_v, UNQUANTIZED);
+    compute_error_metrics("Full MXFP4 vs Naive MXFP4", h_naive_baseline_mxfp4, h_result_temp, 
+                         batch, seq_len, d_v, UNQUANTIZED);
 
     printf("\n");
 
@@ -732,6 +806,14 @@ int main() {
     for (int i = 0; i < num_kernels_nf4_naive; i++) total_nf4_naive += kernel_times_nf4_naive[i];
     printf("  Total (sum):                  %.4f ms\n", total_nf4_naive);
 
+    const char* kernel_names_nf4_naive[] = {
+        "Dequantize_Wq", "Dequantize_Wk", "Dequantize_Wv",
+        "Linear_Projection_Q", "Linear_Projection_K", "Linear_Projection_V",
+        "Flash_Attention"
+    };
+    save_kernel_latency_to_csv(csv_file, "NF4", "Naive", 
+                                kernel_times_nf4_naive, num_kernels_nf4_naive, kernel_names_nf4_naive);
+
     // Copy NF4 result back
     CUDA_CHECK(cudaMemcpy(h_result_temp, d_output, out_size, cudaMemcpyDeviceToHost));
 
@@ -797,9 +879,19 @@ int main() {
     for (int i = 0; i < num_kernels_nf4_proj; i++) total_nf4_proj += kernel_times_nf4_proj[i];
     printf("  Total (sum):                  %.4f ms\n", total_nf4_proj);
     
-    // // Compare with baseline (both NF4, should match closely)
-    // compute_error_metrics("Tiled NF4 vs Naive NF4", h_naive_baseline_nf4, h_result_temp, 
-    //                      batch, seq_len, d_v, UNQUANTIZED);
+    const char* kernel_names_nf4_proj[] = {
+        "Dequantize Wq",
+        "Dequantize Wk",
+        "Dequantize Wv",
+        "Fused QKV Projection",
+        "Flash Attention"
+    };
+    save_kernel_latency_to_csv(csv_file, "NF4", "Projection_Fused", 
+                                kernel_times_nf4_proj, num_kernels_nf4_proj, kernel_names_nf4_proj);
+    
+    // Compare with baseline (both NF4, should match closely)
+    compute_error_metrics("Projection Fused NF4 vs Naive NF4", h_naive_baseline_nf4, h_result_temp, 
+                         batch, seq_len, d_v, UNQUANTIZED);
 
     cooldown_gpu(COOLDOWN_SECONDS);
     printf("\n3. Semi Fused Flash Attention (NF4)\n");
@@ -851,9 +943,17 @@ int main() {
     for (int i = 0; i < num_kernels_nf4_semi; i++) total_nf4_semi += kernel_times_nf4_semi[i];
     printf("  Total (sum):                  %.4f ms\n", total_nf4_semi);
     
-    // // Compare with baseline (both NF4, should match closely)
-    // compute_error_metrics("Flash NF4 vs Naive NF4", h_naive_baseline_nf4, h_result_temp, 
-    //                      batch, seq_len, d_v, UNQUANTIZED);
+    const char* kernel_names_nf4_semi[] = {
+        "Fused QKV Dequant",
+        "Fused QKV Projection",
+        "Flash Attention"
+    };
+    save_kernel_latency_to_csv(csv_file, "NF4", "Semi_Fused", 
+                                kernel_times_nf4_semi, num_kernels_nf4_semi, kernel_names_nf4_semi);
+    
+    // Compare with baseline (both NF4, should match closely)
+    compute_error_metrics("Semi Fused NF4 vs Naive NF4", h_naive_baseline_nf4, h_result_temp, 
+                         batch, seq_len, d_v, UNQUANTIZED);
 
     cooldown_gpu(COOLDOWN_SECONDS);
     printf("\n4. Our Attention (NF4)\n");
@@ -902,9 +1002,16 @@ int main() {
     for (int i = 0; i < num_kernels_nf4_ours; i++) total_nf4_ours += kernel_times_nf4_ours[i];
     printf("  Total (sum):                  %.4f ms\n", total_nf4_ours);
     
-    // // Compare with baseline (both NF4, should match closely)
-    // compute_error_metrics("Our NF4 vs Naive NF4", h_naive_baseline_nf4, h_result_temp, 
-    //                      batch, seq_len, d_v, UNQUANTIZED);
+    const char* kernel_names_nf4_ours[] = {
+        "Fused Dequant+Projection",
+        "Our Attention Kernel"
+    };
+    save_kernel_latency_to_csv(csv_file, "NF4", "Ours", 
+                                kernel_times_nf4_ours, num_kernels_nf4_ours, kernel_names_nf4_ours);
+    
+    // Compare with baseline (both NF4, should match closely)
+    compute_error_metrics("Our NF4 vs Naive NF4", h_naive_baseline_nf4, h_result_temp, 
+                         batch, seq_len, d_v, UNQUANTIZED);
 
     printf("\n");
 
@@ -944,8 +1051,8 @@ int main() {
     printf("Median execution time: %.4f ms\n", elapsed_time_quant);
     
     // Compare with baseline (both NF4, should match closely)
-    // compute_error_metrics("Full NF4 vs Naive NF4", h_naive_baseline_nf4, h_result_temp, 
-    //                      batch, seq_len, d_v, UNQUANTIZED);
+    compute_error_metrics("Full NF4 vs Naive NF4", h_naive_baseline_nf4, h_result_temp, 
+                         batch, seq_len, d_v, UNQUANTIZED);
 
     printf("\n");
 
@@ -1078,6 +1185,18 @@ int main() {
     for (int i = 0; i < num_kernels_nvfp4_naive; i++) total_nvfp4_naive += kernel_times_nvfp4_naive[i];
     printf("  Total (sum):                  %.4f ms\n", total_nvfp4_naive);
     
+    const char* kernel_names_nvfp4_naive[] = {
+        "Dequantize Wq",
+        "Dequantize Wk",
+        "Dequantize Wv",
+        "Linear Projection Q",
+        "Linear Projection K",
+        "Linear Projection V",
+        "Flash Attention"
+    };
+    save_kernel_latency_to_csv(csv_file, "NVFP4", "Naive", 
+                                kernel_times_nvfp4_naive, num_kernels_nvfp4_naive, kernel_names_nvfp4_naive);
+    
     // // Compare with unquantized baseline (using 4-bit quantized thresholds)
     // compute_error_metrics("Naive NVFP4 vs Naive Baseline", h_baseline_unquantized, h_result_temp, 
     //                      batch, seq_len, d_v, FP4_QUANT);
@@ -1135,6 +1254,16 @@ int main() {
     for (int i = 0; i < num_kernels_nvfp4_proj; i++) total_nvfp4_proj += kernel_times_nvfp4_proj[i];
     printf("  Total (sum):                  %.4f ms\n", total_nvfp4_proj);
     
+    const char* kernel_names_nvfp4_proj[] = {
+        "Dequantize Wq",
+        "Dequantize Wk",
+        "Dequantize Wv",
+        "Fused QKV Projection",
+        "Flash Attention"
+    };
+    save_kernel_latency_to_csv(csv_file, "NVFP4", "Projection_Fused", 
+                                kernel_times_nvfp4_proj, num_kernels_nvfp4_proj, kernel_names_nvfp4_proj);
+    
     // Compare with baseline (both NVFP4, should match closely)
     compute_error_metrics("Tiled NVFP4 vs Naive NVFP4", h_naive_baseline_nvfp4, h_result_temp, 
                          batch, seq_len, d_v, UNQUANTIZED);
@@ -1187,6 +1316,14 @@ int main() {
     for (int i = 0; i < num_kernels_nvfp4_semi; i++) total_nvfp4_semi += kernel_times_nvfp4_semi[i];
     printf("  Total (sum):                  %.4f ms\n", total_nvfp4_semi);
     
+    const char* kernel_names_nvfp4_semi[] = {
+        "Fused QKV Dequant",
+        "Fused QKV Projection",
+        "Flash Attention"
+    };
+    save_kernel_latency_to_csv(csv_file, "NVFP4", "Semi_Fused", 
+                                kernel_times_nvfp4_semi, num_kernels_nvfp4_semi, kernel_names_nvfp4_semi);
+    
     // Compare with baseline (both NVFP4, should match closely)
     compute_error_metrics("Flash NVFP4 vs Naive NVFP4", h_naive_baseline_nvfp4, h_result_temp, 
                          batch, seq_len, d_v, UNQUANTIZED);
@@ -1237,6 +1374,13 @@ int main() {
     float total_nvfp4_ours = 0;
     for (int i = 0; i < num_kernels_nvfp4_ours; i++) total_nvfp4_ours += kernel_times_nvfp4_ours[i];
     printf("  Total (sum):                  %.4f ms\n", total_nvfp4_ours);
+    
+    const char* kernel_names_nvfp4_ours[] = {
+        "Fused Dequant+Projection",
+        "Our Attention Kernel"
+    };
+    save_kernel_latency_to_csv(csv_file, "NVFP4", "Ours", 
+                                kernel_times_nvfp4_ours, num_kernels_nvfp4_ours, kernel_names_nvfp4_ours);
     
     // Compare with baseline (both NVFP4, should match closely)
     compute_error_metrics("Our NVFP4 vs Naive NVFP4", h_naive_baseline_nvfp4, h_result_temp, 
@@ -1369,6 +1513,12 @@ int main() {
     CUDA_CHECK(cudaFree(d_Wq_nvfp4));
     CUDA_CHECK(cudaFree(d_Wk_nvfp4));
     CUDA_CHECK(cudaFree(d_Wv_nvfp4));
+
+    // Close CSV file
+    if (csv_file != NULL) {
+        fclose(csv_file);
+        printf("\nKernel latency breakdown saved to: %s\n", csv_filename);
+    }
 
     printf("=== End of Test ===\n");
 
