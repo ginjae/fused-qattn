@@ -1,5 +1,0 @@
-Implementation,No_Quant_ms,MXFP4_ms,NF4_ms,NVFP4_ms
-Naive,0.1425,0.1475,0.1637,0.1773
-Tiled,0.0758,0.0860,0.1136,0.1137
-Flash,0.0644,0.0850,0.0983,0.0993
-Ours,N/A,0.0748,0.0881,0.1178

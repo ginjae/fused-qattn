@@ -3,7 +3,7 @@ MXFP4,Naive,Dequantize_Wq,0.0113
 MXFP4,Naive,Dequantize_Wk,0.0113
 MXFP4,Naive,Dequantize_Wv,0.0113
 MXFP4,Naive,Linear_Projection_Q,0.0338
-MXFP4,Naive,Linear_Projection_K,0.0287
+MXFP4,Naive,Linear_Projection_K,0.0297
 MXFP4,Naive,Linear_Projection_V,0.0297
 MXFP4,Naive,Flash_Attention,0.0184
 MXFP4,Projection_Fused,Dequantize_Wq,0.0113
@@ -18,7 +18,7 @@ MXFP4,Ours,Fused_Dequant_Projection,0.0768
 MXFP4,Ours,Our_Attention_Kernel,0.0184
 NF4,Naive,Dequantize_Wq,0.0113
 NF4,Naive,Dequantize_Wk,0.0113
-NF4,Naive,Dequantize_Wv,0.0108
+NF4,Naive,Dequantize_Wv,0.0113
 NF4,Naive,Linear_Projection_Q,0.0297
 NF4,Naive,Linear_Projection_K,0.0256
 NF4,Naive,Linear_Projection_V,0.0256
@@ -35,8 +35,8 @@ NF4,Ours,Fused Dequant+Projection,0.0717
 NF4,Ours,Our Attention Kernel,0.0184
 NVFP4,Naive,Dequantize Wq,0.0113
 NVFP4,Naive,Dequantize Wk,0.0113
-NVFP4,Naive,Dequantize Wv,0.0108
-NVFP4,Naive,Linear Projection Q,0.0297
+NVFP4,Naive,Dequantize Wv,0.0113
+NVFP4,Naive,Linear Projection Q,0.0307
 NVFP4,Naive,Linear Projection K,0.0256
 NVFP4,Naive,Linear Projection V,0.0256
 NVFP4,Naive,Flash Attention,0.0164

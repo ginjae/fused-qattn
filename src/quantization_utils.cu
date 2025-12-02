@@ -1217,7 +1217,7 @@ __global__ void __launch_bounds__(256, 4) fused_nf4_qkv_projection_kernel(
     const int col = blockIdx.x * TILE_SIZE + threadIdx.x;
     const int tid_y = threadIdx.y;
     const int tid_x = threadIdx.x;
-    const int tid = tid_y * TILE_SIZE + tid_x;  // Linear thread ID for cooperative loading
+    // const int tid = tid_y * TILE_SIZE + tid_x;  // Linear thread ID for cooperative loading
 
     // Register tiling: accumulate in registers for better performance
     float sum_q = 0.0f, sum_k = 0.0f, sum_v = 0.0f;

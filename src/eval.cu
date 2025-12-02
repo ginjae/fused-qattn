@@ -1450,6 +1450,47 @@ int main() {
     printf("======================================================================================\n");
     printf("Note: Values are median end-to-end latencies over %d iterations (not kernel breakdown sums)\n", NUM_ITERATIONS);
 
+    // Save performance summary to CSV
+    char perf_csv_filename[512];
+    time_t perf_now = time(NULL);
+    struct tm* perf_t = localtime(&perf_now);
+    
+    snprintf(perf_csv_filename, sizeof(perf_csv_filename), 
+             "results/performance_%s_%04d%02d%02d_%02d%02d%02d.csv",
+             deviceProp.name,
+             perf_t->tm_year + 1900, perf_t->tm_mon + 1, perf_t->tm_mday,
+             perf_t->tm_hour, perf_t->tm_min, perf_t->tm_sec);
+    
+    // Replace spaces in filename with underscores
+    for (char* p = perf_csv_filename; *p; p++) {
+        if (*p == ' ') *p = '_';
+    }
+    
+    FILE* perf_csv_file = fopen(perf_csv_filename, "w");
+    if (perf_csv_file != NULL) {
+        // Write header
+        fprintf(perf_csv_file, "Implementation,MXFP4_ms,NF4_ms,NVFP4_ms\n");
+        
+        // Write data rows
+        fprintf(perf_csv_file, "Naive,%.4f,%.4f,%.4f\n", 
+                time_mxfp4_naive, time_nf4_naive, time_nvfp4_naive);
+        fprintf(perf_csv_file, "Projection-Fused,%.4f,%.4f,%.4f\n", 
+                time_mxfp4_projection, time_nf4_projection, time_nvfp4_projection);
+        fprintf(perf_csv_file, "Semi-Fused,%.4f,%.4f,%.4f\n", 
+                time_mxfp4_semi, time_nf4_semi, time_nvfp4_semi);
+        fprintf(perf_csv_file, "Ours,%.4f,%.4f,%.4f\n", 
+                time_mxfp4_ours, time_nf4_ours, time_nvfp4_ours);
+        fprintf(perf_csv_file, "Full,%.4f,%.4f,%.4f\n", 
+                time_mxfp4_full, time_nf4_full, time_nvfp4_full);
+        
+        fclose(perf_csv_file);
+        printf("\nPerformance summary saved to: %s\n", perf_csv_filename);
+    } else {
+        printf("\nWarning: Could not create performance summary CSV file: %s\n", perf_csv_filename);
+    }
+
+
+
 
 
     // Cleanup
