@@ -1164,12 +1164,32 @@ __global__ void fused_dequant_qkv_projection_kernel(
 // Fused NF4 Dequantization + QKV Projection Kernel
 // ============================================================================
 
-// Kernel: Fused NF4 Dequantization + QKV Projection
-// Performs on-the-fly NF4 dequantization during matrix multiplication
+// Helper device function for NF4 dequantization (GPU-optimized with LDG)
+__device__ __forceinline__ float dequantize_nf4_element(
+    const NF4Block* __restrict__ W_quantized,
+    int w_idx
+) {
+    const int block_idx = w_idx / NF4_BLOCK_SIZE;
+    const int local_idx = w_idx % NF4_BLOCK_SIZE;
+    
+    // Use __ldg for read-only cache (texture cache) access
+    const float absmax = __ldg(&W_quantized[block_idx].absmax);
+    const uint8_t packed = __ldg(&W_quantized[block_idx].data[local_idx >> 1]);
+    
+    // Branchless bit extraction using bit manipulation
+    const uint8_t shift = (local_idx & 1) << 2;  // 0 or 4
+    const uint8_t nf4_val = min((packed >> (4 - shift)) & 0xF, (uint8_t)15);
+    
+    // Direct table lookup with const memory access
+    return __ldg(&NF4_QUANT_TABLE_GPU[nf4_val]) * absmax;
+}
+
+// Kernel: Fused NF4 Dequantization + QKV Projection (GPU-optimized)
+// GPU-specific optimizations: software pipelining, warp-level ops, register tiling
 // X: [batch, seq_len, d_model]
 // Wq_quantized, Wk_quantized, Wv_quantized: NF4Block arrays
 // Q, K, V: [batch, seq_len, d_k/d_v]
-__global__ void fused_nf4_qkv_projection_kernel(
+__global__ void __launch_bounds__(256, 4) fused_nf4_qkv_projection_kernel(
     const float* __restrict__ X,
     const NF4Block* __restrict__ Wq_quantized,
     const NF4Block* __restrict__ Wk_quantized,
@@ -1186,132 +1206,198 @@ __global__ void fused_nf4_qkv_projection_kernel(
     int d_k,
     int d_v
 ) {
-    // Padded shared memory to avoid bank conflicts
-    __shared__ float X_tile[TILE_SIZE][TILE_SIZE + 1];
-    __shared__ float Wq_tile[TILE_SIZE][TILE_SIZE + 1];
-    __shared__ float Wk_tile[TILE_SIZE][TILE_SIZE + 1];
-    __shared__ float Wv_tile[TILE_SIZE][TILE_SIZE + 1];
+    // Double-buffered shared memory for software pipelining
+    __shared__ float X_tile[2][TILE_SIZE][TILE_SIZE + 1];
+    __shared__ float Wq_tile[2][TILE_SIZE][TILE_SIZE + 1];
+    __shared__ float Wk_tile[2][TILE_SIZE][TILE_SIZE + 1];
+    __shared__ float Wv_tile[2][TILE_SIZE][TILE_SIZE + 1];
 
     const int b_idx = blockIdx.z;
     const int row = blockIdx.y * TILE_SIZE + threadIdx.y;
     const int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    const int tid_y = threadIdx.y;
+    const int tid_x = threadIdx.x;
+    // const int tid = tid_y * TILE_SIZE + tid_x;  // Linear thread ID for cooperative loading
 
-    float sum_q = 0.0f;
-    float sum_k = 0.0f;
-    float sum_v = 0.0f;
+    // Register tiling: accumulate in registers for better performance
+    float sum_q = 0.0f, sum_k = 0.0f, sum_v = 0.0f;
 
-    // Pre-compute base index for X access
+    // Pre-compute frequently used values
     const int x_base = b_idx * seq_len * d_model + row * d_model;
+    const bool valid_batch_row = (b_idx < batch) && (row < seq_len);
+    const int num_tiles = (d_model + TILE_SIZE - 1) / TILE_SIZE;
 
-    for (int t = 0; t < (d_model + TILE_SIZE - 1) / TILE_SIZE; t++) {
-        // 1. Load X tile once (shared for all three projections)
-        const int x_col = t * TILE_SIZE + threadIdx.x;
-        if (b_idx < batch && row < seq_len && x_col < d_model) {
-            X_tile[threadIdx.y][threadIdx.x] = __ldg(&X[x_base + x_col]);
-        } else {
-            X_tile[threadIdx.y][threadIdx.x] = 0.0f;
-        }
+    // Software pipelining: prefetch first tile
+    int write_idx = 0;
+    int read_idx = 1;
+    
+    // Prefetch first tile (t=0)
+    {
+        const int x_col = tid_x;
+        const bool valid_x = valid_batch_row && (x_col < d_model);
+        X_tile[write_idx][tid_y][tid_x] = valid_x ? __ldg(&X[x_base + x_col]) : 0.0f;
 
-        const int w_row = t * TILE_SIZE + threadIdx.y;
+        const int w_row = tid_y;
         const int w_col = col;
+        const bool valid_w_row = (w_row < d_model);
+        const bool valid_wqk = valid_w_row && (w_col < d_k);
+        const bool valid_wv = valid_w_row && (w_col < d_v);
 
-        // 2. Load and dequantize ALL weight tiles in parallel
-        // Dequantize Wq from NF4
-        if (w_row < d_model && w_col < d_k) {
-            const int wq_idx = w_row * d_k + w_col;
-            const int block_idx = wq_idx / NF4_BLOCK_SIZE;
-            const int local_idx = wq_idx % NF4_BLOCK_SIZE;
-            
-            const float absmax = Wq_quantized[block_idx].absmax;
-            
-            // Unpack 4-bit value
-            uint8_t nf4_val;
-            if (local_idx % 2 == 0) {
-                nf4_val = (Wq_quantized[block_idx].data[local_idx / 2] >> 4) & 0xF;
-            } else {
-                nf4_val = Wq_quantized[block_idx].data[local_idx / 2] & 0xF;
-            }
-            
-            if (nf4_val >= 16) nf4_val = 15;
-            Wq_tile[threadIdx.y][threadIdx.x] = NF4_QUANT_TABLE_GPU[nf4_val] * absmax;
-
-            // Dequantize Wk from NF4
-            const int wk_idx = w_row * d_k + w_col;
-            const int block_idx_k = wk_idx / NF4_BLOCK_SIZE;
-            const int local_idx_k = wk_idx % NF4_BLOCK_SIZE;
-            
-            const float absmax_k = Wk_quantized[block_idx_k].absmax;
-            
-            uint8_t nf4_val_k;
-            if (local_idx_k % 2 == 0) {
-                nf4_val_k = (Wk_quantized[block_idx_k].data[local_idx_k / 2] >> 4) & 0xF;
-            } else {
-                nf4_val_k = Wk_quantized[block_idx_k].data[local_idx_k / 2] & 0xF;
-            }
-            
-            if (nf4_val_k >= 16) nf4_val_k = 15;
-            Wk_tile[threadIdx.y][threadIdx.x] = NF4_QUANT_TABLE_GPU[nf4_val_k] * absmax_k;
+        if (valid_wqk) {
+            Wq_tile[write_idx][tid_y][tid_x] = dequantize_nf4_element(Wq_quantized, w_row * d_k + w_col);
+            Wk_tile[write_idx][tid_y][tid_x] = dequantize_nf4_element(Wk_quantized, w_row * d_k + w_col);
         } else {
-            Wq_tile[threadIdx.y][threadIdx.x] = 0.0f;
-            Wk_tile[threadIdx.y][threadIdx.x] = 0.0f;
+            Wq_tile[write_idx][tid_y][tid_x] = 0.0f;
+            Wk_tile[write_idx][tid_y][tid_x] = 0.0f;
         }
 
-        // Dequantize Wv from NF4
-        if (w_row < d_model && w_col < d_v) {
-            const int wv_idx = w_row * d_v + w_col;
-            const int block_idx_v = wv_idx / NF4_BLOCK_SIZE;
-            const int local_idx_v = wv_idx % NF4_BLOCK_SIZE;
-            
-            const float absmax_v = Wv_quantized[block_idx_v].absmax;
-            
-            uint8_t nf4_val_v;
-            if (local_idx_v % 2 == 0) {
-                nf4_val_v = (Wv_quantized[block_idx_v].data[local_idx_v / 2] >> 4) & 0xF;
-            } else {
-                nf4_val_v = Wv_quantized[block_idx_v].data[local_idx_v / 2] & 0xF;
-            }
-            
-            if (nf4_val_v >= 16) nf4_val_v = 15;
-            Wv_tile[threadIdx.y][threadIdx.x] = NF4_QUANT_TABLE_GPU[nf4_val_v] * absmax_v;
-        } else {
-            Wv_tile[threadIdx.y][threadIdx.x] = 0.0f;
-        }
-
-        // 3. Single sync after all loads
+        Wv_tile[write_idx][tid_y][tid_x] = valid_wv ? 
+            dequantize_nf4_element(Wv_quantized, w_row * d_v + w_col) : 0.0f;
+        
         __syncthreads();
+    }
 
-        // 4. Compute all three matmuls together
+    // Main loop with software pipelining
+    for (int t = 0; t < num_tiles; t++) {
+        // Swap buffers
+        read_idx = write_idx;
+        write_idx = 1 - write_idx;
+
+        // Prefetch next tile while computing current tile
+        if (t + 1 < num_tiles) {
+            const int next_x_col = (t + 1) * TILE_SIZE + tid_x;
+            const bool next_valid_x = valid_batch_row && (next_x_col < d_model);
+            X_tile[write_idx][tid_y][tid_x] = next_valid_x ? __ldg(&X[x_base + next_x_col]) : 0.0f;
+
+            const int next_w_row = (t + 1) * TILE_SIZE + tid_y;
+            const int next_w_col = col;
+            const bool next_valid_w_row = (next_w_row < d_model);
+            const bool next_valid_wqk = next_valid_w_row && (next_w_col < d_k);
+            const bool next_valid_wv = next_valid_w_row && (next_w_col < d_v);
+
+            if (next_valid_wqk) {
+                Wq_tile[write_idx][tid_y][tid_x] = dequantize_nf4_element(Wq_quantized, next_w_row * d_k + next_w_col);
+                Wk_tile[write_idx][tid_y][tid_x] = dequantize_nf4_element(Wk_quantized, next_w_row * d_k + next_w_col);
+            } else {
+                Wq_tile[write_idx][tid_y][tid_x] = 0.0f;
+                Wk_tile[write_idx][tid_y][tid_x] = 0.0f;
+            }
+
+            Wv_tile[write_idx][tid_y][tid_x] = next_valid_wv ? 
+                dequantize_nf4_element(Wv_quantized, next_w_row * d_v + next_w_col) : 0.0f;
+        }
+
+        // Compute using current tile (read_idx) with explicit unrolling
+        #pragma unroll 8
         for (int k = 0; k < TILE_SIZE; k++) {
-            float x_val = X_tile[threadIdx.y][k];
-            sum_q = __fmaf_rn(x_val, Wq_tile[k][threadIdx.x], sum_q);
-            sum_k = __fmaf_rn(x_val, Wk_tile[k][threadIdx.x], sum_k);
-            sum_v = __fmaf_rn(x_val, Wv_tile[k][threadIdx.x], sum_v);
+            const float x_val = X_tile[read_idx][tid_y][k];
+            sum_q = __fmaf_rn(x_val, Wq_tile[read_idx][k][tid_x], sum_q);
+            sum_k = __fmaf_rn(x_val, Wk_tile[read_idx][k][tid_x], sum_k);
+            sum_v = __fmaf_rn(x_val, Wv_tile[read_idx][k][tid_x], sum_v);
         }
+        
         __syncthreads();
     }
 
-    // Write Q result with bias (coalesced writes)
-    if (b_idx < batch && row < seq_len && col < d_k) {
-        if (bq != nullptr) {
-            sum_q += __ldg(&bq[col]);
+    // Write results with bias (vectorized writes where possible)
+    if (valid_batch_row) {
+        const int out_base_qk = b_idx * seq_len * d_k + row * d_k;
+        const int out_base_v = b_idx * seq_len * d_v + row * d_v;
+        
+        if (col < d_k) {
+            sum_q = (bq != nullptr) ? sum_q + __ldg(&bq[col]) : sum_q;
+            sum_k = (bk != nullptr) ? sum_k + __ldg(&bk[col]) : sum_k;
+            
+            Q[out_base_qk + col] = sum_q;
+            K[out_base_qk + col] = sum_k;
         }
-        Q[b_idx * seq_len * d_k + row * d_k + col] = sum_q;
+        
+        if (col < d_v) {
+            sum_v = (bv != nullptr) ? sum_v + __ldg(&bv[col]) : sum_v;
+            V[out_base_v + col] = sum_v;
+        }
+    }
+}
+
+// ============================================================================
+// Fused NF4 Dequantization Only (No Projection)
+// ============================================================================
+
+// Kernel: Fused NF4 Dequantization for Wq, Wk, Wv (No Projection)
+// Performs on-the-fly NF4 dequantization without matrix multiplication
+// Wq_quantized, Wk_quantized, Wv_quantized: NF4Block arrays
+// Wq_out, Wk_out, Wv_out: Dequantized weight matrices
+__global__ void fused_nf4_qkv_dequant_kernel(
+    const NF4Block* __restrict__ Wq_quantized,
+    const NF4Block* __restrict__ Wk_quantized,
+    const NF4Block* __restrict__ Wv_quantized,
+    float* __restrict__ Wq_out,
+    float* __restrict__ Wk_out,
+    float* __restrict__ Wv_out,
+    int d_model,
+    int d_k,
+    int d_v
+) {
+    // Each thread processes one element from each weight matrix
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Dequantize Wq
+    if (row < d_model && col < d_k) {
+        const int wq_idx = row * d_k + col;
+        const int block_idx = wq_idx / NF4_BLOCK_SIZE;
+        const int local_idx = wq_idx % NF4_BLOCK_SIZE;
+        
+        const float absmax = Wq_quantized[block_idx].absmax;
+        
+        // Unpack 4-bit value
+        uint8_t nf4_val;
+        if (local_idx % 2 == 0) {
+            nf4_val = (Wq_quantized[block_idx].data[local_idx / 2] >> 4) & 0xF;
+        } else {
+            nf4_val = Wq_quantized[block_idx].data[local_idx / 2] & 0xF;
+        }
+        
+        if (nf4_val >= 16) nf4_val = 15;
+        Wq_out[wq_idx] = NF4_QUANT_TABLE_GPU[nf4_val] * absmax;
     }
 
-    // Write K result with bias
-    if (b_idx < batch && row < seq_len && col < d_k) {
-        if (bk != nullptr) {
-            sum_k += __ldg(&bk[col]);
+    // Dequantize Wk
+    if (row < d_model && col < d_k) {
+        const int wk_idx = row * d_k + col;
+        const int block_idx = wk_idx / NF4_BLOCK_SIZE;
+        const int local_idx = wk_idx % NF4_BLOCK_SIZE;
+        
+        const float absmax = Wk_quantized[block_idx].absmax;
+        
+        uint8_t nf4_val;
+        if (local_idx % 2 == 0) {
+            nf4_val = (Wk_quantized[block_idx].data[local_idx / 2] >> 4) & 0xF;
+        } else {
+            nf4_val = Wk_quantized[block_idx].data[local_idx / 2] & 0xF;
         }
-        K[b_idx * seq_len * d_k + row * d_k + col] = sum_k;
+        
+        if (nf4_val >= 16) nf4_val = 15;
+        Wk_out[wk_idx] = NF4_QUANT_TABLE_GPU[nf4_val] * absmax;
     }
 
-    // Write V result with bias
-    if (b_idx < batch && row < seq_len && col < d_v) {
-        if (bv != nullptr) {
-            sum_v += __ldg(&bv[col]);
+    // Dequantize Wv
+    if (row < d_model && col < d_v) {
+        const int wv_idx = row * d_v + col;
+        const int block_idx = wv_idx / NF4_BLOCK_SIZE;
+        const int local_idx = wv_idx % NF4_BLOCK_SIZE;
+        
+        const float absmax = Wv_quantized[block_idx].absmax;
+        
+        uint8_t nf4_val;
+        if (local_idx % 2 == 0) {
+            nf4_val = (Wv_quantized[block_idx].data[local_idx / 2] >> 4) & 0xF;
+        } else {
+            nf4_val = Wv_quantized[block_idx].data[local_idx / 2] & 0xF;
         }
-        V[b_idx * seq_len * d_v + row * d_v + col] = sum_v;
+        
+        if (nf4_val >= 16) nf4_val = 15;
+        Wv_out[wv_idx] = NF4_QUANT_TABLE_GPU[nf4_val] * absmax;
     }
 }
 
@@ -1401,12 +1487,31 @@ __global__ void fused_nf4_qkv_dequant_kernel(
 // Fused MXFP4 Dequantization + QKV Projection Kernel
 // ============================================================================
 
-// Kernel: Fused MXFP4 Dequantization + QKV Projection
-// Performs on-the-fly MXFP4 dequantization during matrix multiplication
+// Helper device function for MXFP4 dequantization (GPU-optimized with LDG)
+__device__ __forceinline__ float dequantize_mxfp4_element(
+    const MXFP4Block* __restrict__ W_quantized,
+    int w_idx
+) {
+    const int block_idx = w_idx / MXFP4_BLOCK_SIZE;
+    const int local_idx = w_idx % MXFP4_BLOCK_SIZE;
+    
+    // Use __ldg for texture cache access
+    const int shared_exp = (int)__ldg(&W_quantized[block_idx].shared_exp) - 127;
+    const uint8_t packed = __ldg(&W_quantized[block_idx].data[local_idx >> 1]);
+    
+    // Branchless bit extraction
+    const uint8_t shift = (local_idx & 1) << 2;  // 0 or 4
+    const uint8_t fp4_val = (packed >> (4 - shift)) & 0xF;
+    
+    return fp4_mantissa_to_float(fp4_val, shared_exp);
+}
+
+// Kernel: Fused MXFP4 Dequantization + QKV Projection (GPU-optimized)
+// GPU-specific optimizations: software pipelining, warp-level ops, register tiling
 // X: [batch, seq_len, d_model]
 // Wq_quantized, Wk_quantized, Wv_quantized: MXFP4Block arrays
 // Q, K, V: [batch, seq_len, d_k/d_v]
-__global__ void fused_mxfp4_qkv_projection_kernel(
+__global__ void __launch_bounds__(256, 4) fused_mxfp4_qkv_projection_kernel(
     const float* __restrict__ X,
     const MXFP4Block* __restrict__ Wq_quantized,
     const MXFP4Block* __restrict__ Wk_quantized,
@@ -1423,129 +1528,193 @@ __global__ void fused_mxfp4_qkv_projection_kernel(
     int d_k,
     int d_v
 ) {
-    // Padded shared memory to avoid bank conflicts
-    __shared__ float X_tile[TILE_SIZE][TILE_SIZE + 1];
-    __shared__ float Wq_tile[TILE_SIZE][TILE_SIZE + 1];
-    __shared__ float Wk_tile[TILE_SIZE][TILE_SIZE + 1];
-    __shared__ float Wv_tile[TILE_SIZE][TILE_SIZE + 1];
+    // Double-buffered shared memory for software pipelining
+    __shared__ float X_tile[2][TILE_SIZE][TILE_SIZE + 1];
+    __shared__ float Wq_tile[2][TILE_SIZE][TILE_SIZE + 1];
+    __shared__ float Wk_tile[2][TILE_SIZE][TILE_SIZE + 1];
+    __shared__ float Wv_tile[2][TILE_SIZE][TILE_SIZE + 1];
 
     const int b_idx = blockIdx.z;
     const int row = blockIdx.y * TILE_SIZE + threadIdx.y;
     const int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    const int tid_y = threadIdx.y;
+    const int tid_x = threadIdx.x;
 
-    float sum_q = 0.0f;
-    float sum_k = 0.0f;
-    float sum_v = 0.0f;
+    // Register tiling: accumulate in registers
+    float sum_q = 0.0f, sum_k = 0.0f, sum_v = 0.0f;
 
-    // Pre-compute base index for X access
+    // Pre-compute frequently used values
     const int x_base = b_idx * seq_len * d_model + row * d_model;
+    const bool valid_batch_row = (b_idx < batch) && (row < seq_len);
+    const int num_tiles = (d_model + TILE_SIZE - 1) / TILE_SIZE;
 
-    for (int t = 0; t < (d_model + TILE_SIZE - 1) / TILE_SIZE; t++) {
-        // 1. Load X tile once (shared for all three projections)
-        const int x_col = t * TILE_SIZE + threadIdx.x;
-        if (b_idx < batch && row < seq_len && x_col < d_model) {
-            X_tile[threadIdx.y][threadIdx.x] = __ldg(&X[x_base + x_col]);
-        } else {
-            X_tile[threadIdx.y][threadIdx.x] = 0.0f;
-        }
+    // Software pipelining: prefetch first tile
+    int write_idx = 0;
+    int read_idx = 1;
+    
+    // Prefetch first tile
+    {
+        const int x_col = tid_x;
+        const bool valid_x = valid_batch_row && (x_col < d_model);
+        X_tile[write_idx][tid_y][tid_x] = valid_x ? __ldg(&X[x_base + x_col]) : 0.0f;
 
-        const int w_row = t * TILE_SIZE + threadIdx.y;
+        const int w_row = tid_y;
         const int w_col = col;
+        const bool valid_w_row = (w_row < d_model);
+        const bool valid_wqk = valid_w_row && (w_col < d_k);
+        const bool valid_wv = valid_w_row && (w_col < d_v);
 
-        // 2. Load and dequantize ALL weight tiles in parallel
-        // Dequantize Wq from MXFP4
-        if (w_row < d_model && w_col < d_k) {
-            const int wq_idx = w_row * d_k + w_col;
-            const int block_idx = wq_idx / MXFP4_BLOCK_SIZE;
-            const int local_idx = wq_idx % MXFP4_BLOCK_SIZE;
-            
-            const int shared_exp = (int)Wq_quantized[block_idx].shared_exp - 127;
-            
-            // Unpack 4-bit value
-            uint8_t fp4_val;
-            if (local_idx % 2 == 0) {
-                fp4_val = (Wq_quantized[block_idx].data[local_idx / 2] >> 4) & 0xF;
-            } else {
-                fp4_val = Wq_quantized[block_idx].data[local_idx / 2] & 0xF;
-            }
-            
-            Wq_tile[threadIdx.y][threadIdx.x] = fp4_mantissa_to_float(fp4_val, shared_exp);
-
-            // Dequantize Wk from MXFP4
-            const int wk_idx = w_row * d_k + w_col;
-            const int block_idx_k = wk_idx / MXFP4_BLOCK_SIZE;
-            const int local_idx_k = wk_idx % MXFP4_BLOCK_SIZE;
-            
-            const int shared_exp_k = (int)Wk_quantized[block_idx_k].shared_exp - 127;
-            
-            uint8_t fp4_val_k;
-            if (local_idx_k % 2 == 0) {
-                fp4_val_k = (Wk_quantized[block_idx_k].data[local_idx_k / 2] >> 4) & 0xF;
-            } else {
-                fp4_val_k = Wk_quantized[block_idx_k].data[local_idx_k / 2] & 0xF;
-            }
-            
-            Wk_tile[threadIdx.y][threadIdx.x] = fp4_mantissa_to_float(fp4_val_k, shared_exp_k);
+        if (valid_wqk) {
+            Wq_tile[write_idx][tid_y][tid_x] = dequantize_mxfp4_element(Wq_quantized, w_row * d_k + w_col);
+            Wk_tile[write_idx][tid_y][tid_x] = dequantize_mxfp4_element(Wk_quantized, w_row * d_k + w_col);
         } else {
-            Wq_tile[threadIdx.y][threadIdx.x] = 0.0f;
-            Wk_tile[threadIdx.y][threadIdx.x] = 0.0f;
+            Wq_tile[write_idx][tid_y][tid_x] = 0.0f;
+            Wk_tile[write_idx][tid_y][tid_x] = 0.0f;
         }
 
-        // Dequantize Wv from MXFP4
-        if (w_row < d_model && w_col < d_v) {
-            const int wv_idx = w_row * d_v + w_col;
-            const int block_idx_v = wv_idx / MXFP4_BLOCK_SIZE;
-            const int local_idx_v = wv_idx % MXFP4_BLOCK_SIZE;
-            
-            const int shared_exp_v = (int)Wv_quantized[block_idx_v].shared_exp - 127;
-            
-            uint8_t fp4_val_v;
-            if (local_idx_v % 2 == 0) {
-                fp4_val_v = (Wv_quantized[block_idx_v].data[local_idx_v / 2] >> 4) & 0xF;
-            } else {
-                fp4_val_v = Wv_quantized[block_idx_v].data[local_idx_v / 2] & 0xF;
-            }
-            
-            Wv_tile[threadIdx.y][threadIdx.x] = fp4_mantissa_to_float(fp4_val_v, shared_exp_v);
-        } else {
-            Wv_tile[threadIdx.y][threadIdx.x] = 0.0f;
-        }
-
-        // 3. Single sync after all loads
+        Wv_tile[write_idx][tid_y][tid_x] = valid_wv ? 
+            dequantize_mxfp4_element(Wv_quantized, w_row * d_v + w_col) : 0.0f;
+        
         __syncthreads();
+    }
 
-        // 4. Compute all three matmuls together
+    // Main loop with software pipelining
+    for (int t = 0; t < num_tiles; t++) {
+        read_idx = write_idx;
+        write_idx = 1 - write_idx;
+
+        // Prefetch next tile while computing current tile
+        if (t + 1 < num_tiles) {
+            const int next_x_col = (t + 1) * TILE_SIZE + tid_x;
+            const bool next_valid_x = valid_batch_row && (next_x_col < d_model);
+            X_tile[write_idx][tid_y][tid_x] = next_valid_x ? __ldg(&X[x_base + next_x_col]) : 0.0f;
+
+            const int next_w_row = (t + 1) * TILE_SIZE + tid_y;
+            const int next_w_col = col;
+            const bool next_valid_w_row = (next_w_row < d_model);
+            const bool next_valid_wqk = next_valid_w_row && (next_w_col < d_k);
+            const bool next_valid_wv = next_valid_w_row && (next_w_col < d_v);
+
+            if (next_valid_wqk) {
+                Wq_tile[write_idx][tid_y][tid_x] = dequantize_mxfp4_element(Wq_quantized, next_w_row * d_k + next_w_col);
+                Wk_tile[write_idx][tid_y][tid_x] = dequantize_mxfp4_element(Wk_quantized, next_w_row * d_k + next_w_col);
+            } else {
+                Wq_tile[write_idx][tid_y][tid_x] = 0.0f;
+                Wk_tile[write_idx][tid_y][tid_x] = 0.0f;
+            }
+
+            Wv_tile[write_idx][tid_y][tid_x] = next_valid_wv ? 
+                dequantize_mxfp4_element(Wv_quantized, next_w_row * d_v + next_w_col) : 0.0f;
+        }
+
+        // Compute using current tile with explicit unrolling
+        #pragma unroll 8
         for (int k = 0; k < TILE_SIZE; k++) {
-            float x_val = X_tile[threadIdx.y][k];
-            sum_q = __fmaf_rn(x_val, Wq_tile[k][threadIdx.x], sum_q);
-            sum_k = __fmaf_rn(x_val, Wk_tile[k][threadIdx.x], sum_k);
-            sum_v = __fmaf_rn(x_val, Wv_tile[k][threadIdx.x], sum_v);
+            const float x_val = X_tile[read_idx][tid_y][k];
+            sum_q = __fmaf_rn(x_val, Wq_tile[read_idx][k][tid_x], sum_q);
+            sum_k = __fmaf_rn(x_val, Wk_tile[read_idx][k][tid_x], sum_k);
+            sum_v = __fmaf_rn(x_val, Wv_tile[read_idx][k][tid_x], sum_v);
         }
+        
         __syncthreads();
     }
 
-    // Write Q result with bias (coalesced writes)
-    if (b_idx < batch && row < seq_len && col < d_k) {
-        if (bq != nullptr) {
-            sum_q += __ldg(&bq[col]);
+    // Write results with bias
+    if (valid_batch_row) {
+        const int out_base_qk = b_idx * seq_len * d_k + row * d_k;
+        const int out_base_v = b_idx * seq_len * d_v + row * d_v;
+        
+        if (col < d_k) {
+            sum_q = (bq != nullptr) ? sum_q + __ldg(&bq[col]) : sum_q;
+            sum_k = (bk != nullptr) ? sum_k + __ldg(&bk[col]) : sum_k;
+            
+            Q[out_base_qk + col] = sum_q;
+            K[out_base_qk + col] = sum_k;
         }
-        Q[b_idx * seq_len * d_k + row * d_k + col] = sum_q;
+        
+        if (col < d_v) {
+            sum_v = (bv != nullptr) ? sum_v + __ldg(&bv[col]) : sum_v;
+            V[out_base_v + col] = sum_v;
+        }
+    }
+}
+
+// ============================================================================
+// Fused MXFP4 Dequantization Only (No Projection)
+// ============================================================================
+
+// Kernel: Fused MXFP4 Dequantization for Wq, Wk, Wv (No Projection)
+// Performs on-the-fly MXFP4 dequantization without matrix multiplication
+// Wq_quantized, Wk_quantized, Wv_quantized: MXFP4Block arrays
+// Wq_out, Wk_out, Wv_out: Dequantized weight matrices
+__global__ void fused_mxfp4_qkv_dequant_kernel(
+    const MXFP4Block* __restrict__ Wq_quantized,
+    const MXFP4Block* __restrict__ Wk_quantized,
+    const MXFP4Block* __restrict__ Wv_quantized,
+    float* __restrict__ Wq_out,
+    float* __restrict__ Wk_out,
+    float* __restrict__ Wv_out,
+    int d_model,
+    int d_k,
+    int d_v
+) {
+    // Each thread processes one element from each weight matrix
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Dequantize Wq
+    if (row < d_model && col < d_k) {
+        const int wq_idx = row * d_k + col;
+        const int block_idx = wq_idx / MXFP4_BLOCK_SIZE;
+        const int local_idx = wq_idx % MXFP4_BLOCK_SIZE;
+        
+        const int shared_exp = (int)Wq_quantized[block_idx].shared_exp - 127;
+        
+        // Unpack 4-bit value
+        uint8_t fp4_val;
+        if (local_idx % 2 == 0) {
+            fp4_val = (Wq_quantized[block_idx].data[local_idx / 2] >> 4) & 0xF;
+        } else {
+            fp4_val = Wq_quantized[block_idx].data[local_idx / 2] & 0xF;
+        }
+        
+        Wq_out[wq_idx] = fp4_mantissa_to_float(fp4_val, shared_exp);
     }
 
-    // Write K result with bias
-    if (b_idx < batch && row < seq_len && col < d_k) {
-        if (bk != nullptr) {
-            sum_k += __ldg(&bk[col]);
+    // Dequantize Wk
+    if (row < d_model && col < d_k) {
+        const int wk_idx = row * d_k + col;
+        const int block_idx = wk_idx / MXFP4_BLOCK_SIZE;
+        const int local_idx = wk_idx % MXFP4_BLOCK_SIZE;
+        
+        const int shared_exp = (int)Wk_quantized[block_idx].shared_exp - 127;
+        
+        uint8_t fp4_val;
+        if (local_idx % 2 == 0) {
+            fp4_val = (Wk_quantized[block_idx].data[local_idx / 2] >> 4) & 0xF;
+        } else {
+            fp4_val = Wk_quantized[block_idx].data[local_idx / 2] & 0xF;
         }
-        K[b_idx * seq_len * d_k + row * d_k + col] = sum_k;
+        
+        Wk_out[wk_idx] = fp4_mantissa_to_float(fp4_val, shared_exp);
     }
 
-    // Write V result with bias
-    if (b_idx < batch && row < seq_len && col < d_v) {
-        if (bv != nullptr) {
-            sum_v += __ldg(&bv[col]);
+    // Dequantize Wv
+    if (row < d_model && col < d_v) {
+        const int wv_idx = row * d_v + col;
+        const int block_idx = wv_idx / MXFP4_BLOCK_SIZE;
+        const int local_idx = wv_idx % MXFP4_BLOCK_SIZE;
+        
+        const int shared_exp = (int)Wv_quantized[block_idx].shared_exp - 127;
+        
+        uint8_t fp4_val;
+        if (local_idx % 2 == 0) {
+            fp4_val = (Wv_quantized[block_idx].data[local_idx / 2] >> 4) & 0xF;
+        } else {
+            fp4_val = Wv_quantized[block_idx].data[local_idx / 2] & 0xF;
         }
-        V[b_idx * seq_len * d_v + row * d_v + col] = sum_v;
+        
+        Wv_out[wv_idx] = fp4_mantissa_to_float(fp4_val, shared_exp);
     }
 }
 
@@ -1632,13 +1801,36 @@ __global__ void fused_mxfp4_qkv_dequant_kernel(
 // Fused NVFP4 Dequantization + QKV Projection Kernel
 // ============================================================================
 
-// Kernel: Fused NVFP4 Dequantization + QKV Projection
+// Helper device function for NVFP4 dequantization (GPU-optimized with LDG)
+__device__ __forceinline__ float dequantize_nvfp4_element(
+    const NVFP4Block* __restrict__ W_quantized,
+    int w_idx,
+    float s_dec_global
+) {
+    const int block_idx = w_idx / NVFP4_BLOCK_SIZE;
+    const int local_idx = w_idx % NVFP4_BLOCK_SIZE;
+    
+    // Use __ldg for texture cache access
+    const float s_dec_local_e4m3 = fp8_e4m3_to_float(__ldg(&W_quantized[block_idx].scale_e4m3));
+    const float combined_scale = s_dec_local_e4m3 * s_dec_global;
+    
+    // Branchless bit extraction
+    const uint8_t packed = __ldg(&W_quantized[block_idx].data[local_idx >> 1]);
+    const uint8_t shift = (local_idx & 1) << 2;  // 0 or 4
+    const uint8_t nvfp4_val = (packed >> (4 - shift)) & 0xF;
+    
+    return __ldg(&NVFP4_E2M1_TABLE_GPU[nvfp4_val]) * combined_scale;
+}
+
+// Kernel: Fused NVFP4 Dequantization + QKV Projection (Optimized)
+// Kernel: Fused NVFP4 Dequantization + QKV Projection (GPU-optimized)
+// GPU-specific optimizations: software pipelining, warp-level ops, register tiling
 // Performs on-the-fly NVFP4 dequantization with 2-level scaling
 // X: [batch, seq_len, d_model]
 // Wq_quantized, Wk_quantized, Wv_quantized: NVFP4Block arrays
 // s_dec_global_q/k/v: per-tensor FP32 decode scales
 // Q, K, V: [batch, seq_len, d_k/d_v]
-__global__ void fused_nvfp4_qkv_projection_kernel(
+__global__ void __launch_bounds__(256, 4) fused_nvfp4_qkv_projection_kernel(
     const float* __restrict__ X,
     const NVFP4Block* __restrict__ Wq_quantized,
     const NVFP4Block* __restrict__ Wk_quantized,
@@ -1658,136 +1850,199 @@ __global__ void fused_nvfp4_qkv_projection_kernel(
     int d_k,
     int d_v
 ) {
-    // Padded shared memory to avoid bank conflicts
-    __shared__ float X_tile[TILE_SIZE][TILE_SIZE + 1];
-    __shared__ float Wq_tile[TILE_SIZE][TILE_SIZE + 1];
-    __shared__ float Wk_tile[TILE_SIZE][TILE_SIZE + 1];
-    __shared__ float Wv_tile[TILE_SIZE][TILE_SIZE + 1];
+    // Double-buffered shared memory for software pipelining
+    __shared__ float X_tile[2][TILE_SIZE][TILE_SIZE + 1];
+    __shared__ float Wq_tile[2][TILE_SIZE][TILE_SIZE + 1];
+    __shared__ float Wk_tile[2][TILE_SIZE][TILE_SIZE + 1];
+    __shared__ float Wv_tile[2][TILE_SIZE][TILE_SIZE + 1];
 
     const int b_idx = blockIdx.z;
     const int row = blockIdx.y * TILE_SIZE + threadIdx.y;
     const int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    const int tid_y = threadIdx.y;
+    const int tid_x = threadIdx.x;
 
-    float sum_q = 0.0f;
-    float sum_k = 0.0f;
-    float sum_v = 0.0f;
+    // Register tiling: accumulate in registers
+    float sum_q = 0.0f, sum_k = 0.0f, sum_v = 0.0f;
 
-    // Pre-compute base index for X access
+    // Pre-compute frequently used values
     const int x_base = b_idx * seq_len * d_model + row * d_model;
+    const bool valid_batch_row = (b_idx < batch) && (row < seq_len);
+    const int num_tiles = (d_model + TILE_SIZE - 1) / TILE_SIZE;
 
-    for (int t = 0; t < (d_model + TILE_SIZE - 1) / TILE_SIZE; t++) {
-        // 1. Load X tile once (shared for all three projections)
-        const int x_col = t * TILE_SIZE + threadIdx.x;
-        if (b_idx < batch && row < seq_len && x_col < d_model) {
-            X_tile[threadIdx.y][threadIdx.x] = __ldg(&X[x_base + x_col]);
-        } else {
-            X_tile[threadIdx.y][threadIdx.x] = 0.0f;
-        }
+    // Software pipelining: prefetch first tile
+    int write_idx = 0;
+    int read_idx = 1;
+    
+    // Prefetch first tile
+    {
+        const int x_col = tid_x;
+        const bool valid_x = valid_batch_row && (x_col < d_model);
+        X_tile[write_idx][tid_y][tid_x] = valid_x ? __ldg(&X[x_base + x_col]) : 0.0f;
 
-        const int w_row = t * TILE_SIZE + threadIdx.y;
+        const int w_row = tid_y;
         const int w_col = col;
+        const bool valid_w_row = (w_row < d_model);
+        const bool valid_wqk = valid_w_row && (w_col < d_k);
+        const bool valid_wv = valid_w_row && (w_col < d_v);
 
-        // 2. Load and dequantize ALL weight tiles in parallel
-        // Dequantize Wq from NVFP4 with 2-level scaling
-        if (w_row < d_model && w_col < d_k) {
-            const int wq_idx = w_row * d_k + w_col;
-            const int block_idx = wq_idx / NVFP4_BLOCK_SIZE;
-            const int local_idx = wq_idx % NVFP4_BLOCK_SIZE;
-            
-            // Get local E4M3 scale and apply 2-level scaling
-            const float s_dec_local_e4m3 = fp8_e4m3_to_float(Wq_quantized[block_idx].scale_e4m3);
-            const float combined_scale = s_dec_local_e4m3 * s_dec_global_q;
-            
-            // Unpack 4-bit value
-            uint8_t nvfp4_val;
-            if (local_idx % 2 == 0) {
-                nvfp4_val = (Wq_quantized[block_idx].data[local_idx / 2] >> 4) & 0xF;
-            } else {
-                nvfp4_val = Wq_quantized[block_idx].data[local_idx / 2] & 0xF;
-            }
-            
-            // if (nvfp4_val >= 16) nvfp4_val = 15;
-            Wq_tile[threadIdx.y][threadIdx.x] = NVFP4_E2M1_TABLE_GPU[nvfp4_val] * combined_scale;
-
-            // Dequantize Wk from NVFP4 with 2-level scaling
-            const int wk_idx = w_row * d_k + w_col;
-            const int block_idx_k = wk_idx / NVFP4_BLOCK_SIZE;
-            const int local_idx_k = wk_idx % NVFP4_BLOCK_SIZE;
-            
-            const float s_dec_local_e4m3_k = fp8_e4m3_to_float(Wk_quantized[block_idx_k].scale_e4m3);
-            const float combined_scale_k = s_dec_local_e4m3_k * s_dec_global_k;
-            
-            uint8_t nvfp4_val_k;
-            if (local_idx_k % 2 == 0) {
-                nvfp4_val_k = (Wk_quantized[block_idx_k].data[local_idx_k / 2] >> 4) & 0xF;
-            } else {
-                nvfp4_val_k = Wk_quantized[block_idx_k].data[local_idx_k / 2] & 0xF;
-            }
-            
-            // if (nvfp4_val_k >= 16) nvfp4_val_k = 15;
-            Wk_tile[threadIdx.y][threadIdx.x] = NVFP4_E2M1_TABLE_GPU[nvfp4_val_k] * combined_scale_k;
+        if (valid_wqk) {
+            Wq_tile[write_idx][tid_y][tid_x] = dequantize_nvfp4_element(Wq_quantized, w_row * d_k + w_col, s_dec_global_q);
+            Wk_tile[write_idx][tid_y][tid_x] = dequantize_nvfp4_element(Wk_quantized, w_row * d_k + w_col, s_dec_global_k);
         } else {
-            Wq_tile[threadIdx.y][threadIdx.x] = 0.0f;
-            Wk_tile[threadIdx.y][threadIdx.x] = 0.0f;
+            Wq_tile[write_idx][tid_y][tid_x] = 0.0f;
+            Wk_tile[write_idx][tid_y][tid_x] = 0.0f;
         }
 
-        // Dequantize Wv from NVFP4 with 2-level scaling
-        if (w_row < d_model && w_col < d_v) {
-            const int wv_idx = w_row * d_v + w_col;
-            const int block_idx_v = wv_idx / NVFP4_BLOCK_SIZE;
-            const int local_idx_v = wv_idx % NVFP4_BLOCK_SIZE;
-            
-            const float s_dec_local_e4m3_v = fp8_e4m3_to_float(Wv_quantized[block_idx_v].scale_e4m3);
-            const float combined_scale_v = s_dec_local_e4m3_v * s_dec_global_v;
-            
-            uint8_t nvfp4_val_v;
-            if (local_idx_v % 2 == 0) {
-                nvfp4_val_v = (Wv_quantized[block_idx_v].data[local_idx_v / 2] >> 4) & 0xF;
-            } else {
-                nvfp4_val_v = Wv_quantized[block_idx_v].data[local_idx_v / 2] & 0xF;
-            }
-            
-            // if (nvfp4_val_v >= 16) nvfp4_val_v = 15;
-            Wv_tile[threadIdx.y][threadIdx.x] = NVFP4_E2M1_TABLE_GPU[nvfp4_val_v] * combined_scale_v;
-        } else {
-            Wv_tile[threadIdx.y][threadIdx.x] = 0.0f;
-        }
-
-        // 3. Single sync after all loads
+        Wv_tile[write_idx][tid_y][tid_x] = valid_wv ? 
+            dequantize_nvfp4_element(Wv_quantized, w_row * d_v + w_col, s_dec_global_v) : 0.0f;
+        
         __syncthreads();
+    }
 
-        // 4. Compute all three matmuls together
+    // Main loop with software pipelining
+    for (int t = 0; t < num_tiles; t++) {
+        read_idx = write_idx;
+        write_idx = 1 - write_idx;
+
+        // Prefetch next tile while computing current tile
+        if (t + 1 < num_tiles) {
+            const int next_x_col = (t + 1) * TILE_SIZE + tid_x;
+            const bool next_valid_x = valid_batch_row && (next_x_col < d_model);
+            X_tile[write_idx][tid_y][tid_x] = next_valid_x ? __ldg(&X[x_base + next_x_col]) : 0.0f;
+
+            const int next_w_row = (t + 1) * TILE_SIZE + tid_y;
+            const int next_w_col = col;
+            const bool next_valid_w_row = (next_w_row < d_model);
+            const bool next_valid_wqk = next_valid_w_row && (next_w_col < d_k);
+            const bool next_valid_wv = next_valid_w_row && (next_w_col < d_v);
+
+            if (next_valid_wqk) {
+                Wq_tile[write_idx][tid_y][tid_x] = dequantize_nvfp4_element(Wq_quantized, next_w_row * d_k + next_w_col, s_dec_global_q);
+                Wk_tile[write_idx][tid_y][tid_x] = dequantize_nvfp4_element(Wk_quantized, next_w_row * d_k + next_w_col, s_dec_global_k);
+            } else {
+                Wq_tile[write_idx][tid_y][tid_x] = 0.0f;
+                Wk_tile[write_idx][tid_y][tid_x] = 0.0f;
+            }
+
+            Wv_tile[write_idx][tid_y][tid_x] = next_valid_wv ? 
+                dequantize_nvfp4_element(Wv_quantized, next_w_row * d_v + next_w_col, s_dec_global_v) : 0.0f;
+        }
+
+        // Compute using current tile with explicit unrolling
+        #pragma unroll 8
         for (int k = 0; k < TILE_SIZE; k++) {
-            float x_val = X_tile[threadIdx.y][k];
-            sum_q = __fmaf_rn(x_val, Wq_tile[k][threadIdx.x], sum_q);
-            sum_k = __fmaf_rn(x_val, Wk_tile[k][threadIdx.x], sum_k);
-            sum_v = __fmaf_rn(x_val, Wv_tile[k][threadIdx.x], sum_v);
+            const float x_val = X_tile[read_idx][tid_y][k];
+            sum_q = __fmaf_rn(x_val, Wq_tile[read_idx][k][tid_x], sum_q);
+            sum_k = __fmaf_rn(x_val, Wk_tile[read_idx][k][tid_x], sum_k);
+            sum_v = __fmaf_rn(x_val, Wv_tile[read_idx][k][tid_x], sum_v);
         }
+        
         __syncthreads();
     }
 
-    // Write Q result with bias (coalesced writes)
-    if (b_idx < batch && row < seq_len && col < d_k) {
-        if (bq != nullptr) {
-            sum_q += __ldg(&bq[col]);
+    // Write results with bias
+    if (valid_batch_row) {
+        const int out_base_qk = b_idx * seq_len * d_k + row * d_k;
+        const int out_base_v = b_idx * seq_len * d_v + row * d_v;
+        
+        if (col < d_k) {
+            sum_q = (bq != nullptr) ? sum_q + __ldg(&bq[col]) : sum_q;
+            sum_k = (bk != nullptr) ? sum_k + __ldg(&bk[col]) : sum_k;
+            
+            Q[out_base_qk + col] = sum_q;
+            K[out_base_qk + col] = sum_k;
         }
-        Q[b_idx * seq_len * d_k + row * d_k + col] = sum_q;
+        
+        if (col < d_v) {
+            sum_v = (bv != nullptr) ? sum_v + __ldg(&bv[col]) : sum_v;
+            V[out_base_v + col] = sum_v;
+        }
+    }
+}
+
+// ============================================================================
+// Fused NVFP4 Dequantization for QKV Weights (No Projection)
+// ============================================================================
+
+// Kernel: Fused NVFP4 Dequantization for QKV Weights (No Projection)
+// Only performs on-the-fly NVFP4 dequantization with 2-level scaling
+// Wq_quantized, Wk_quantized, Wv_quantized: NVFP4Block arrays
+// s_dec_global_q/k/v: per-tensor FP32 decode scales
+// Wq_dequant, Wk_dequant, Wv_dequant: Dequantized FP32 weight matrices
+__global__ void fused_nvfp4_qkv_dequant_kernel(
+    const NVFP4Block* __restrict__ Wq_quantized,
+    const NVFP4Block* __restrict__ Wk_quantized,
+    const NVFP4Block* __restrict__ Wv_quantized,
+    float s_dec_global_q,
+    float s_dec_global_k,
+    float s_dec_global_v,
+    float* __restrict__ Wq_dequant,
+    float* __restrict__ Wk_dequant,
+    float* __restrict__ Wv_dequant,
+    int d_model,
+    int d_k,
+    int d_v
+) {
+    // Each thread handles one element from each weight matrix
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_elements_qk = d_model * d_k;
+    const int total_elements_v = d_model * d_v;
+
+    // Dequantize Wq
+    if (idx < total_elements_qk) {
+        const int block_idx = idx / NVFP4_BLOCK_SIZE;
+        const int local_idx = idx % NVFP4_BLOCK_SIZE;
+        
+        // Get local E4M3 scale and apply 2-level scaling
+        const float s_dec_local_e4m3 = fp8_e4m3_to_float(Wq_quantized[block_idx].scale_e4m3);
+        const float combined_scale = s_dec_local_e4m3 * s_dec_global_q;
+        
+        // Unpack 4-bit value
+        uint8_t nvfp4_val;
+        if (local_idx % 2 == 0) {
+            nvfp4_val = (Wq_quantized[block_idx].data[local_idx / 2] >> 4) & 0xF;
+        } else {
+            nvfp4_val = Wq_quantized[block_idx].data[local_idx / 2] & 0xF;
+        }
+        
+        Wq_dequant[idx] = NVFP4_E2M1_TABLE_GPU[nvfp4_val] * combined_scale;
     }
 
-    // Write K result with bias
-    if (b_idx < batch && row < seq_len && col < d_k) {
-        if (bk != nullptr) {
-            sum_k += __ldg(&bk[col]);
+    // Dequantize Wk
+    if (idx < total_elements_qk) {
+        const int block_idx = idx / NVFP4_BLOCK_SIZE;
+        const int local_idx = idx % NVFP4_BLOCK_SIZE;
+        
+        const float s_dec_local_e4m3 = fp8_e4m3_to_float(Wk_quantized[block_idx].scale_e4m3);
+        const float combined_scale = s_dec_local_e4m3 * s_dec_global_k;
+        
+        uint8_t nvfp4_val;
+        if (local_idx % 2 == 0) {
+            nvfp4_val = (Wk_quantized[block_idx].data[local_idx / 2] >> 4) & 0xF;
+        } else {
+            nvfp4_val = Wk_quantized[block_idx].data[local_idx / 2] & 0xF;
         }
-        K[b_idx * seq_len * d_k + row * d_k + col] = sum_k;
+        
+        Wk_dequant[idx] = NVFP4_E2M1_TABLE_GPU[nvfp4_val] * combined_scale;
     }
 
-    // Write V result with bias
-    if (b_idx < batch && row < seq_len && col < d_v) {
-        if (bv != nullptr) {
-            sum_v += __ldg(&bv[col]);
+    // Dequantize Wv
+    if (idx < total_elements_v) {
+        const int block_idx = idx / NVFP4_BLOCK_SIZE;
+        const int local_idx = idx % NVFP4_BLOCK_SIZE;
+        
+        const float s_dec_local_e4m3 = fp8_e4m3_to_float(Wv_quantized[block_idx].scale_e4m3);
+        const float combined_scale = s_dec_local_e4m3 * s_dec_global_v;
+        
+        uint8_t nvfp4_val;
+        if (local_idx % 2 == 0) {
+            nvfp4_val = (Wv_quantized[block_idx].data[local_idx / 2] >> 4) & 0xF;
+        } else {
+            nvfp4_val = Wv_quantized[block_idx].data[local_idx / 2] & 0xF;
         }
-        V[b_idx * seq_len * d_v + row * d_v + col] = sum_v;
+        
+        Wv_dequant[idx] = NVFP4_E2M1_TABLE_GPU[nvfp4_val] * combined_scale;
     }
 }
 

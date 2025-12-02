@@ -59,7 +59,9 @@ void flash_attention_mxfp4(
     int d_model,
     int d_k,
     int d_v,
-    bool causal_mask
+    bool causal_mask,
+    float* kernel_times = nullptr,
+    int* num_kernels = nullptr
 );
 
 void flash_attention_nf4(
@@ -76,7 +78,9 @@ void flash_attention_nf4(
     int d_model,
     int d_k,
     int d_v,
-    bool causal_mask = false
+    bool causal_mask = false,
+    float* kernel_times = nullptr,
+    int* num_kernels = nullptr
 );
 
 void flash_attention_nvfp4(
@@ -96,7 +100,129 @@ void flash_attention_nvfp4(
     int d_model,
     int d_k,
     int d_v,
-    bool causal_mask = false
+    bool causal_mask = false,
+    float* kernel_times = nullptr,
+    int* num_kernels = nullptr
+);
+
+void naive_flash_attention_mxfp4(
+    const float* d_X,
+    const void* d_Wq_mxfp4,
+    const void* d_Wk_mxfp4,
+    const void* d_Wv_mxfp4,
+    const float* d_bq,
+    const float* d_bk,
+    const float* d_bv,
+    float* d_output,
+    int batch,
+    int seq_len,
+    int d_model,
+    int d_k,
+    int d_v,
+    bool causal_mask = false,
+    float* kernel_times = nullptr,
+    int* num_kernels = nullptr
+);
+
+void naive_flash_attention_nf4(
+    const float* d_X,
+    const void* d_Wq_nf4,
+    const void* d_Wk_nf4,
+    const void* d_Wv_nf4,
+    const float* d_bq,
+    const float* d_bk,
+    const float* d_bv,
+    float* d_output,
+    int batch,
+    int seq_len,
+    int d_model,
+    int d_k,
+    int d_v,
+    bool causal_mask = false,
+    float* kernel_times = nullptr,
+    int* num_kernels = nullptr
+);
+
+void naive_flash_attention_nvfp4(
+    const float* d_X,
+    const void* d_Wq_nvfp4,
+    const void* d_Wk_nvfp4,
+    const void* d_Wv_nvfp4,
+    const NVFP4TensorMeta* d_Wq_meta,
+    const NVFP4TensorMeta* d_Wk_meta,
+    const NVFP4TensorMeta* d_Wv_meta,
+    const float* d_bq,
+    const float* d_bk,
+    const float* d_bv,
+    float* d_output,
+    int batch,
+    int seq_len,
+    int d_model,
+    int d_k,
+    int d_v,
+    bool causal_mask = false,
+    float* kernel_times = nullptr,
+    int* num_kernels = nullptr
+);
+
+void fused_flash_attention_mxfp4(
+    const float* d_X,
+    const void* d_Wq_mxfp4,
+    const void* d_Wk_mxfp4,
+    const void* d_Wv_mxfp4,
+    const float* d_bq,
+    const float* d_bk,
+    const float* d_bv,
+    float* d_output,
+    int batch,
+    int seq_len,
+    int d_model,
+    int d_k,
+    int d_v,
+    bool causal_mask = false,
+    float* kernel_times = nullptr,
+    int* num_kernels = nullptr
+);
+
+void fused_flash_attention_nf4(
+    const float* d_X,
+    const void* d_Wq_nf4,
+    const void* d_Wk_nf4,
+    const void* d_Wv_nf4,
+    const float* d_bq,
+    const float* d_bk,
+    const float* d_bv,
+    float* d_output,
+    int batch,
+    int seq_len,
+    int d_model,
+    int d_k,
+    int d_v,
+    bool causal_mask = false,
+    float* kernel_times = nullptr,
+    int* num_kernels = nullptr
+);
+
+void fused_flash_attention_nvfp4(
+    const float* d_X,
+    const void* d_Wq_nvfp4,
+    const void* d_Wk_nvfp4,
+    const void* d_Wv_nvfp4,
+    const NVFP4TensorMeta* d_Wq_meta,
+    const NVFP4TensorMeta* d_Wk_meta,
+    const NVFP4TensorMeta* d_Wv_meta,
+    const float* d_bq,
+    const float* d_bk,
+    const float* d_bv,
+    float* d_output,
+    int batch,
+    int seq_len,
+    int d_model,
+    int d_k,
+    int d_v,
+    bool causal_mask = false,
+    float* kernel_times = nullptr,
+    int* num_kernels = nullptr
 );
 
 void naive_flash_attention_mxfp4(

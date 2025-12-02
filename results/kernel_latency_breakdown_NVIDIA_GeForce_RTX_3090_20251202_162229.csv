@@ -1,0 +1,52 @@
+Quantization,Implementation,Kernel,Time_ms
+MXFP4,Naive,Dequantize_Wq,0.0113
+MXFP4,Naive,Dequantize_Wk,0.0113
+MXFP4,Naive,Dequantize_Wv,0.0113
+MXFP4,Naive,Linear_Projection_Q,0.0338
+MXFP4,Naive,Linear_Projection_K,0.0297
+MXFP4,Naive,Linear_Projection_V,0.0297
+MXFP4,Naive,Flash_Attention,0.0184
+MXFP4,Projection_Fused,Dequantize_Wq,0.0113
+MXFP4,Projection_Fused,Dequantize_Wk,0.0113
+MXFP4,Projection_Fused,Dequantize_Wv,0.0113
+MXFP4,Projection_Fused,Fused_QKV_Projection,0.0676
+MXFP4,Projection_Fused,Flash_Attention,0.0184
+MXFP4,Semi_Fused,Fused_QKV_Dequant,0.0113
+MXFP4,Semi_Fused,Fused_QKV_Projection,0.0676
+MXFP4,Semi_Fused,Flash_Attention,0.0184
+MXFP4,Ours,Fused_Dequant_Projection,0.0768
+MXFP4,Ours,Our_Attention_Kernel,0.0184
+NF4,Naive,Dequantize_Wq,0.0113
+NF4,Naive,Dequantize_Wk,0.0113
+NF4,Naive,Dequantize_Wv,0.0113
+NF4,Naive,Linear_Projection_Q,0.0297
+NF4,Naive,Linear_Projection_K,0.0256
+NF4,Naive,Linear_Projection_V,0.0256
+NF4,Naive,Flash_Attention,0.0164
+NF4,Projection_Fused,Dequantize Wq,0.0113
+NF4,Projection_Fused,Dequantize Wk,0.0113
+NF4,Projection_Fused,Dequantize Wv,0.0113
+NF4,Projection_Fused,Fused QKV Projection,0.0676
+NF4,Projection_Fused,Flash Attention,0.0184
+NF4,Semi_Fused,Fused QKV Dequant,0.0113
+NF4,Semi_Fused,Fused QKV Projection,0.0676
+NF4,Semi_Fused,Flash Attention,0.0184
+NF4,Ours,Fused Dequant+Projection,0.0717
+NF4,Ours,Our Attention Kernel,0.0184
+NVFP4,Naive,Dequantize Wq,0.0113
+NVFP4,Naive,Dequantize Wk,0.0113
+NVFP4,Naive,Dequantize Wv,0.0113
+NVFP4,Naive,Linear Projection Q,0.0307
+NVFP4,Naive,Linear Projection K,0.0256
+NVFP4,Naive,Linear Projection V,0.0256
+NVFP4,Naive,Flash Attention,0.0164
+NVFP4,Projection_Fused,Dequantize Wq,0.0113
+NVFP4,Projection_Fused,Dequantize Wk,0.0113
+NVFP4,Projection_Fused,Dequantize Wv,0.0113
+NVFP4,Projection_Fused,Fused QKV Projection,0.0676
+NVFP4,Projection_Fused,Flash Attention,0.0184
+NVFP4,Semi_Fused,Fused QKV Dequant,0.0123
+NVFP4,Semi_Fused,Fused QKV Projection,0.0676
+NVFP4,Semi_Fused,Flash Attention,0.0184
+NVFP4,Ours,Fused Dequant+Projection,0.1065
+NVFP4,Ours,Our Attention Kernel,0.0184
